@@ -574,12 +574,14 @@ mod tests {
 
     #[test]
     fn a_save_replaces_the_last_and_leaves_nothing_beside_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("walk.bin");
+        let temp = tempfile::tempdir().unwrap();
+        // A directory the save makes: an elevated one refuses any other.
+        let dir = temp.path().join("walk");
+        let path = dir.join("walk.bin");
         save(&path, &state(Node::directory("old"))).unwrap();
         save(&path, &state(sample())).unwrap();
         assert_eq!(&*load(&path).unwrap().tree.name, "C:\\");
-        let names: Vec<_> = std::fs::read_dir(dir.path())
+        let names: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();

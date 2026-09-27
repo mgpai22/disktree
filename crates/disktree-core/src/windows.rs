@@ -32,12 +32,15 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
-    ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE, MAX_PATH,
-    OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_ALREADY_EXISTS, ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL,
+    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED,
+    INVALID_HANDLE_VALUE, MAX_PATH, OBJ_CASE_INSENSITIVE,
+    RtlNtStatusToDosError, UNICODE_STRING,
 };
+use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    CreateDirectoryW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
     FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
@@ -1017,22 +1020,119 @@ fn standard_sizes(file: &File) -> io::Result<(u64, u64)> {
     ))
 }
 
+/// What an elevated process makes its caches with: owned by the
+/// Administrators group, under a protected ACL that grants Administrators
+/// and SYSTEM alone any access. No ordinary process of the user can then
+/// change what an elevated scan reads back.
+const CACHE_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)";
+
 /// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `_POSIX_SEMANTICS`.
 const RENAME_REPLACE: u32 = 1;
 const RENAME_POSIX: u32 = 2;
 
-/// The directory `dir`, open, and for `create` made first: what is in it
-/// is then opened through this handle, and nothing above it is looked up
-/// again.
-fn cache_directory(dir: &Path, create: bool) -> io::Result<File> {
-    if create {
-        fs::create_dir_all(dir)?;
+/// A security descriptor Win32 allocated, freed when dropped.
+struct CacheSecurity(*mut core::ffi::c_void);
+
+impl Drop for CacheSecurity {
+    fn drop(&mut self) {
+        // SAFETY: Win32 allocated this descriptor with LocalAlloc; this
+        // wrapper alone owns it and drops it once after all calls finish.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
     }
-    OpenOptions::new()
+}
+
+fn cache_security() -> io::Result<CacheSecurity> {
+    descriptor_from_sddl(CACHE_SDDL)
+}
+
+fn descriptor_from_sddl(sddl: &str) -> io::Result<CacheSecurity> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: the NUL-terminated SDDL lives throughout the call; the
+    // output pointer receives a LocalAlloc descriptor owned by the caller.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            1,
+            &raw mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(CacheSecurity(descriptor))
+}
+
+/// Where the cache `name` under `dir` is kept: `mft-<drive>.bin` for a
+/// file table read, `walk-<root>.bin` for a walk. An elevated process
+/// keeps its own apart, in `admin`, and never reads the ones the user's
+/// ordinary processes keep beside it.
+pub fn cache_path(dir: &Path, name: &str) -> PathBuf {
+    if elevated() {
+        dir.join("admin").join(name)
+    } else {
+        dir.join(name)
+    }
+}
+
+/// The directory `dir`, open, and for `create` made first. An elevated
+/// process makes it with the admin-only owner and ACL, and takes it only
+/// while it is a directory rather than a link to one. It holds it
+/// without share-delete, so no one moves it away meanwhile.
+fn cache_directory(dir: &Path, create: bool, admin: bool) -> io::Result<File> {
+    if !admin {
+        if create {
+            fs::create_dir_all(dir)?;
+        }
+        // The user's own: a folder moved elsewhere and linked back is
+        // followed, as any other path of theirs.
+        return OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir);
+    }
+    if create {
+        let parent = dir
+            .parent()
+            .ok_or_else(|| io::Error::other("cache parent missing"))?;
+        fs::create_dir_all(parent)?;
+        let descriptor = cache_security()?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let name = wide(dir, false)?;
+        // SAFETY: the path is NUL-terminated; the attributes and the
+        // descriptor they point at are live for the call.
+        let made =
+            unsafe { CreateDirectoryW(name.as_ptr(), &raw const attributes) };
+        if made == 0 {
+            // One already there is checked below, like any other.
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS.cast_signed())
+            {
+                return Err(error);
+            }
+        }
+    }
+    let handle = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(dir)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(dir)?;
+    let attributes = winapi_util::file::information(&handle)?.file_attributes();
+    if attributes & u64::from(FILE_ATTRIBUTE_DIRECTORY) == 0
+        || attributes & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache directory is a link",
+        ));
+    }
+    Ok(handle)
 }
 
 /// Open, or as `disposition` says make, the file `name` in the open
@@ -1044,6 +1144,7 @@ fn open_in(
     access: u32,
     share: u32,
     disposition: u32,
+    security: Option<&CacheSecurity>,
 ) -> io::Result<File> {
     let name: Vec<u16> = name.encode_wide().collect();
     let length = u16::try_from(name.len() * 2).map_err(|_| {
@@ -1059,13 +1160,14 @@ fn open_in(
         RootDirectory: directory.as_raw_handle(),
         ObjectName: &raw const object,
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: std::ptr::null(),
+        SecurityDescriptor: security
+            .map_or(std::ptr::null(), |security| security.0.cast()),
         SecurityQualityOfService: std::ptr::null(),
     };
     let mut handle = std::ptr::null_mut();
     let mut status = IO_STATUS_BLOCK::default();
     // SAFETY: `attributes` and all it points at (the name, the directory's
-    // open handle) are live for the call;
+    // open handle, the descriptor `security` owns) are live for the call;
     // the outputs are live locals; no extended attributes are passed.
     let result = unsafe {
         NtCreateFile(
@@ -1094,15 +1196,21 @@ fn open_in(
 
 /// The cache at `path`, open for reading; `None` sends the scan back to a
 /// whole read. Opened through its directory's handle, and a link in its
-/// place is not followed.
+/// place is not followed. An elevated process reads only its own, in
+/// the admin directory.
 pub fn cache_read(path: &Path) -> Option<File> {
-    let directory = cache_directory(path.parent()?, false).ok()?;
+    read_cache(path, elevated())
+}
+
+fn read_cache(path: &Path, admin: bool) -> Option<File> {
+    let directory = cache_directory(path.parent()?, false, admin).ok()?;
     let file = open_in(
         &directory,
         path.file_name()?,
         FILE_READ_DATA | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN,
+        None,
     )
     .ok()?;
     let attributes = winapi_util::file::information(&file)
@@ -1136,9 +1244,18 @@ pub fn cache_reopen(original: &File) -> io::Result<File> {
 /// file beside it, which then takes its name; on any failure that file is
 /// deleted and `path` keeps what it had. Both go through the directory's
 /// handle, not its path, so a link planted above it cannot send either
-/// elsewhere.
+/// elsewhere; an elevated process's file has the admin-only owner and ACL
+/// from the moment it exists.
 pub fn cache_write(
     path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    write_cache(path, elevated(), write)
+}
+
+fn write_cache(
+    path: &Path,
+    admin: bool,
     write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
@@ -1147,18 +1264,21 @@ pub fn cache_write(
             "a cache is a file in a directory",
         ));
     };
-    let directory = cache_directory(dir, true)?;
+    let directory = cache_directory(dir, true, admin)?;
     // One such name per cache: what a save cut short by a crash leaves is
     // overwritten by the next, not left beside it for good, and sharing
-    // it with readers alone keeps a second save out while one writes.
+    // it with readers alone keeps a second save out while one writes. In
+    // an elevated process's directory nobody else can have made it.
     let mut partial = name.to_os_string();
     partial.push(".partial");
+    let security = if admin { Some(cache_security()?) } else { None };
     let mut file = open_in(
         &directory,
         &partial,
         DELETE | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ,
         FILE_OVERWRITE_IF,
+        security.as_ref(),
     )?;
     let written =
         write(&mut file).and_then(|()| rename_in(&directory, &file, name));
@@ -1290,8 +1410,8 @@ mod tests {
     fn a_failed_cache_write_leaves_the_last_one_and_nothing_beside_it() {
         use std::io::{Read as _, Write as _};
         let temp = TempDir::new().expect("tempdir");
-        // In a directory the write makes.
-        let path = temp.path().join("cache").join("walk.bin");
+        // In a directory the write makes, as an elevated one must.
+        let path = cache_path(&temp.path().join("cache"), "walk.bin");
         cache_write(&path, |out| out.write_all(b"whole")).expect("written");
         let failed = cache_write(&path, |out| {
             out.write_all(b"half")?;

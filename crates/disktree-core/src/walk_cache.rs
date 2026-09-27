@@ -96,7 +96,10 @@ impl Checkpoint {
         options.hash(&mut hash);
         Some(Self {
             root: root.to_path_buf(),
-            file: cache.join(format!("walk-{:016x}.bin", hash.finish())),
+            file: windows::cache_path(
+                cache,
+                &format!("walk-{:016x}.bin", hash.finish()),
+            ),
             handle,
             volume,
             root_id,

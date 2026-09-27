@@ -122,7 +122,7 @@ pub(super) struct State {
 
 /// The file kept for `letter` in `dir`.
 pub(super) fn file(dir: &Path, letter: char) -> PathBuf {
-    dir.join(format!("mft-{letter}.bin"))
+    crate::windows::cache_path(dir, &format!("mft-{letter}.bin"))
 }
 
 pub(super) fn query(volume: &File) -> Option<Journal> {
