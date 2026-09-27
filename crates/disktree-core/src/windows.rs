@@ -677,10 +677,21 @@ pub fn elevated() -> bool {
 /// a folder or a mounted folder to another file system, is walked either way.
 pub fn file_table_readable(root: &Path) -> bool {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let Some(letter) = drive_letter(&canonical) else {
+    drive_letter(&canonical)
+        .is_some_and(|letter| ntfs(Path::new(&format!("{letter}:\\"))))
+}
+
+/// Whether `path` is on an NTFS volume, where a file id is the file's
+/// record with the record's reuse count in its top 16 bits.
+pub fn on_ntfs(path: &Path) -> bool {
+    volume_root(path).is_some_and(|root| ntfs(&root))
+}
+
+/// Whether the volume mounted at `root`, such as `C:\`, is formatted NTFS.
+fn ntfs(root: &Path) -> bool {
+    let Ok(volume) = wide(root, true) else {
         return false;
     };
-    let volume: Vec<u16> = format!("{letter}:\\\0").encode_utf16().collect();
     let mut name = [0_u16; MAX_PATH as usize + 1];
     let length = u32::try_from(name.len()).unwrap_or(u32::MAX);
     // SAFETY: `volume` is NUL-terminated and outlives the call, `name` is

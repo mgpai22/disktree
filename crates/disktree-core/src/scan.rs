@@ -284,8 +284,9 @@ struct WalkContext {
     visited_dirs: Mutex<FxHashSet<(u64, u64)>>,
     /// The tree being built.
     build: Builder,
-    /// Files charged already, when a hardlinked file is charged once.
-    seen: Option<Seen>,
+    /// Files charged already, when a hardlinked file is charged once. Set
+    /// once the walk knows what volume it is on.
+    seen: OnceLock<Seen>,
     /// Serial number of the root's volume, on Windows, for a walk that
     /// cannot leave it: every listing takes it instead of asking. See
     /// [`crate::windows::walk_volume`].
@@ -300,7 +301,7 @@ impl WalkContext {
     ) -> Self {
         Self {
             known,
-            seen: options.dedup_hardlinks.then(Seen::new),
+            seen: OnceLock::new(),
             options,
             progress,
             root_device: Mutex::new(None),
@@ -947,6 +948,21 @@ fn scan_blocking(
             .settle(top.files(), top.dirs(), top.bytes());
         return Ok(Arc::new(tree));
     }
+    if context.options.dedup_hardlinks {
+        // A walk that cannot leave its NTFS volume, grafting nothing kept
+        // from an earlier scan, meets only current file ids.
+        #[cfg(windows)]
+        let current = context.known.is_none()
+            && context.volume.get().is_some()
+            && crate::windows::on_ntfs(canonical);
+        #[cfg(not(windows))]
+        let current = false;
+        let _ = context.seen.set(if current {
+            Seen::by_record()
+        } else {
+            Seen::new()
+        });
+    }
     let index = context
         .build
         .reserve(1)
@@ -1213,7 +1229,7 @@ impl WalkContext {
         // Every name of a file has the file's size, so one that weighs
         // nothing need not be remembered to be charged once.
         if item.value > 0
-            && let Some(seen) = &self.seen
+            && let Some(seen) = self.seen.get()
             && let Some(key) = leaf.identity
             && !seen.insert(key)
         {
@@ -1279,7 +1295,7 @@ impl WalkContext {
                     }
                     if item.value > 0
                         && item.identified()
-                        && let Some(seen) = &self.seen
+                        && let Some(seen) = self.seen.get()
                         && !seen.insert((device, item.id))
                     {
                         item.value = 0;

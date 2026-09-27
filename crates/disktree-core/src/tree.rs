@@ -1119,9 +1119,13 @@ fn push<'n>(chunk: &mut Chunk, run: impl Iterator<Item = (Item, &'n str)>) {
 /// fit, as do most inodes. Anything else goes into the hash set, whole:
 /// a Windows file id keeps the record's reuse count in its top 16 bits,
 /// and that is what tells a file from an older one on the same record,
-/// which a subtree kept from an earlier scan can still hold. The set is
-/// sharded for the walk's millions of those: 4.1 million ids took 150 ms
-/// across 64 locks and 1.2 s behind one, in a synthetic run.
+/// which a subtree kept from an earlier scan can still hold. A walk of
+/// one NTFS volume that kept nothing from before has only current ids,
+/// so for it the record alone is the key and every file gets a bit too:
+/// the hash set of a home folder's 3.6 million ids was 68 MiB, most of
+/// what a cold walk held beyond its tree. The set is sharded for the
+/// millions a walk may still need: 4.1 million ids took 150 ms across 64
+/// locks and 1.2 s behind one, in a synthetic run.
 pub(crate) struct Seen {
     /// The first volume met, which is the scanned root's in all but a scan
     /// that leaves its volume.
@@ -1130,6 +1134,9 @@ pub(crate) struct Seen {
     /// with more than one name carry an identity, never need it.
     bits: LazyLock<Box<[AtomicU64]>>,
     rest: Box<[Shard]>,
+    /// What of a number the bitmap is keyed by: all of it, or the record
+    /// below the reuse count.
+    mask: u64,
 }
 
 impl std::fmt::Debug for Seen {
@@ -1149,7 +1156,21 @@ impl Seen {
     /// Hash set shards, as a power of two.
     const SHARD_BITS: u32 = 6;
 
+    /// The record part of an NTFS file id: its reuse count sits above.
+    const RECORD: u64 = (1 << 48) - 1;
+
+    /// Keys compared whole.
     pub(crate) fn new() -> Self {
+        Self::with_mask(u64::MAX)
+    }
+
+    /// Keys of the first volume compared by NTFS record: only for ids
+    /// that are all current, where one record is one file.
+    pub(crate) fn by_record() -> Self {
+        Self::with_mask(Self::RECORD)
+    }
+
+    fn with_mask(mask: u64) -> Self {
         Self {
             volume: OnceLock::new(),
             bits: LazyLock::new(|| {
@@ -1160,16 +1181,18 @@ impl Seen {
             rest: std::iter::repeat_with(Mutex::default)
                 .take(1 << Self::SHARD_BITS)
                 .collect(),
+            mask,
         }
     }
 
     /// Whether `key` is new.
     pub(crate) fn insert(&self, key: (u64, u64)) -> bool {
         let (volume, number) = key;
-        if *self.volume.get_or_init(|| volume) == volume && number < Self::BITS
+        let bit_at = number & self.mask;
+        if *self.volume.get_or_init(|| volume) == volume && bit_at < Self::BITS
         {
-            let bit = 1 << (number % 64);
-            let word = &self.bits[(number / 64) as usize];
+            let bit = 1 << (bit_at % 64);
+            let word = &self.bits[(bit_at / 64) as usize];
             return word.fetch_or(bit, Ordering::Relaxed) & bit == 0;
         }
         // The top bits of a multiplicative hash, with another constant
@@ -1225,6 +1248,22 @@ mod tests {
         assert!(!seen.insert((7, far)));
         assert!(seen.insert((8, 42)), "another volume's 42 is another file");
         assert!(!seen.insert((8, 42)));
+    }
+
+    #[test]
+    fn seen_by_record_takes_a_reused_record_for_one_file() {
+        let (older, newer) = (0x0001_0000_0000_002A, 0x0002_0000_0000_002A);
+        let whole = Seen::new();
+        assert!(whole.insert((7, older)));
+        assert!(whole.insert((7, newer)), "a kept subtree's older file");
+        // Only a walk of current ids keys by record: one record, one file.
+        let current = Seen::by_record();
+        assert!(current.insert((7, older)));
+        assert!(!current.insert((7, newer)));
+        assert!(current.insert((7, 0x0002_0000_0000_002B)));
+        // Past the first volume, keys stay whole.
+        assert!(current.insert((8, older)));
+        assert!(current.insert((8, newer)));
     }
 
     #[test]
