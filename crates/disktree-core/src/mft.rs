@@ -1519,7 +1519,7 @@ mod tests {
             let table =
                 table(&[(32, ROOT, 5, "target", info)], &options, &progress);
             let tree = tree_of(&table).ok().expect("tree");
-            assert_eq!(tree.children[0].kind, kind);
+            assert_eq!(tree.root().child(0).expect("entry").kind(), kind);
         }
     }
 
