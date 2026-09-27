@@ -1,7 +1,9 @@
-//! Folder snapshots checked against the unprivileged NTFS change journal.
+//! Folder snapshots validated with the unprivileged NTFS change journal.
 //!
-//! The saved tree stays separate from the MFT snapshot. A scan reuses it
-//! when the journal names nothing in it since the walk that made it began.
+//! The saved tree stays separate from the MFT snapshot. A warm scan lists
+//! changed parents and every cached alias of a changed file, then settles
+//! only those ancestor chains. Keeping the original checkpoint avoids a
+//! large cache rewrite on each launch.
 
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash as _, Hasher as _};
@@ -9,7 +11,7 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -18,8 +20,8 @@ use windows_sys::Win32::System::Ioctl::{
     FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_UNPRIVILEGED_USN_JOURNAL,
 };
 
-use super::{ScanOptions, WalkContext};
-use crate::tree::{Metric, Node, NodeKind};
+use super::{Classified, ScanOptions, WalkContext};
+use crate::tree::{Metric, Node, NodeKind, settle_directory, settle_leaf};
 use crate::windows;
 
 #[path = "walk_cache/store.rs"]
@@ -27,6 +29,7 @@ mod store;
 
 const MAX_AGE: u64 = 24 * 60 * 60;
 const MAX_CHANGES: usize = 100_000;
+const MAX_DIRECTORIES: usize = 10_000;
 const MAX_JOURNAL_BYTES: usize = 64 << 20;
 
 #[derive(Clone, Copy)]
@@ -98,7 +101,7 @@ impl Checkpoint {
 
     pub(super) fn resume(&self, context: &WalkContext) -> Option<Node> {
         let started = Instant::now();
-        let state = store::load(&self.file)?;
+        let mut state = store::load(&self.file)?;
         if state.root != self.root.to_str()?
             || state.volume != self.volume
             || state.root_id != self.root_id
@@ -109,11 +112,62 @@ impl Checkpoint {
         {
             return None;
         }
+        let loaded = started.elapsed();
         let changes = changes(&self.handle, self.journal, state.next)?;
-        if !untouched(&state.tree, &changes) || context.cancelled() {
+        let mut update = Update {
+            context,
+            changed: changes.files,
+            parents: changes.parents,
+            refreshed: FxHashSet::default(),
+            touched: FxHashSet::default(),
+            listed: 0,
+        };
+        let mut chains = FxHashSet::default();
+        let mut pending = FxHashSet::default();
+        loop {
+            chains.clear();
+            pending.clear();
+            update.mark(&state.tree, &mut pending, &mut chains)?;
+            if pending.is_empty() {
+                break;
+            }
+            if update.refreshed.len() + pending.len() > MAX_DIRECTORIES {
+                return None;
+            }
+            update.refresh(
+                &mut state.tree,
+                &self.root,
+                &pending,
+                &chains,
+                0,
+            )?;
+            if context.cancelled() || update.touched.len() > MAX_CHANGES {
+                return None;
+            }
+        }
+        let mut seen = FxHashSet::default();
+        update.settle(&mut state.tree, &mut seen);
+        if !update.refreshed.is_empty() {
+            // Classification can depend on sibling names and the dominant
+            // top-level child. Reuse that policy rather than approximate it.
+            crate::classify::classify(&mut state.tree);
+        }
+        let after = query(&self.handle)?;
+        if !covered(&state, after, now()) || after.next < self.journal.next {
             return None;
         }
-        trace(&format!("warm total_ms={}", started.elapsed().as_millis()));
+        if context.cancelled() {
+            return None;
+        }
+        if std::env::var_os("DISKTREE_WALK_TRACE").is_some() {
+            eprintln!(
+                "walk-cache warm load_ms={} total_ms={} relisted={} refreshed_files={}",
+                loaded.as_millis(),
+                started.elapsed().as_millis(),
+                update.refreshed.len(),
+                update.touched.len(),
+            );
+        }
         Some(state.tree)
     }
 
@@ -297,14 +351,195 @@ fn cacheable(node: &Node, volume: u64, depth: usize) -> bool {
         .all(|child| cacheable(child, volume, depth + 1))
 }
 
-/// Whether the journal names nothing in `node`: no folder it lists and no
-/// file in it changed, and no listing below it failed.
-fn untouched(node: &Node, changes: &Changes) -> bool {
-    !node.read_error
-        && node.inode.is_none_or(|(_, id)| {
-            !changes.files.contains(&id) && !changes.parents.contains(&id)
-        })
-        && node.children.iter().all(|child| untouched(child, changes))
+struct Update<'a> {
+    context: &'a WalkContext,
+    changed: FxHashSet<u64>,
+    parents: FxHashSet<u64>,
+    refreshed: FxHashSet<u64>,
+    touched: FxHashSet<u64>,
+    listed: usize,
+}
+
+impl Update<'_> {
+    fn mark(
+        &self,
+        node: &Node,
+        pending: &mut FxHashSet<u64>,
+        chains: &mut FxHashSet<u64>,
+    ) -> Option<bool> {
+        let (_, id) = node.inode?;
+        let mut dirty = !self.refreshed.contains(&id)
+            && (node.read_error
+                || self.parents.contains(&id)
+                || self.changed.contains(&id));
+        let mut below = false;
+        for child in &node.children {
+            if child.is_dir() {
+                below |= self.mark(child, pending, chains)?;
+            } else if !self.refreshed.contains(&id)
+                && child.inode.is_some_and(|(_, file)| {
+                    self.changed.contains(&file) || self.touched.contains(&file)
+                })
+            {
+                dirty = true;
+            }
+        }
+        if dirty {
+            pending.insert(id);
+        }
+        if dirty || below {
+            chains.insert(id);
+        }
+        Some(dirty || below)
+    }
+
+    fn refresh(
+        &mut self,
+        node: &mut Node,
+        path: &Path,
+        pending: &FxHashSet<u64>,
+        chains: &FxHashSet<u64>,
+        depth: usize,
+    ) -> Option<()> {
+        let key = node.inode?;
+        if !chains.contains(&key.1) {
+            return Some(());
+        }
+        if pending.contains(&key.1) && !self.refreshed.contains(&key.1) {
+            self.relist(node, path, depth)?;
+        }
+        for child in &mut node.children {
+            if child.is_dir()
+                && child.inode.is_some_and(|(_, id)| chains.contains(&id))
+            {
+                let path = self.child_path(path, child)?;
+                self.refresh(child, &path, pending, chains, depth + 1)?;
+            }
+        }
+        Some(())
+    }
+
+    fn relist(
+        &mut self,
+        node: &mut Node,
+        path: &Path,
+        depth: usize,
+    ) -> Option<()> {
+        if depth > 512
+            || self.context.cancelled()
+            || self.refreshed.len() >= MAX_DIRECTORIES
+        {
+            return None;
+        }
+        let key = node.inode?;
+        self.refreshed.insert(key.1);
+        let mut old = FxHashMap::default();
+        for child in std::mem::take(&mut node.children) {
+            if child.is_dir() {
+                old.insert(child.inode, child);
+            } else if let Some((_, id)) = child.inode {
+                self.touched.insert(id);
+            }
+        }
+        node.read_error = false;
+        match super::list(path, self.context.volume.get().copied()) {
+            Ok(entries) => {
+                if entries.identity()? != key {
+                    return None;
+                }
+                for entry in entries {
+                    self.listed += 1;
+                    if self.listed > MAX_CHANGES || self.context.cancelled() {
+                        return None;
+                    }
+                    let mut entry = entry.ok()?;
+                    match self.context.classify(path, &mut entry) {
+                        Classified::Subdirectory { path, name, inode } => {
+                            let child =
+                                if let Some(mut child) = old.remove(&inode) {
+                                    child.name = name;
+                                    child
+                                } else {
+                                    let mut child = Node::directory(name);
+                                    child.inode = inode;
+                                    // New trees share cancellation, policy and limits
+                                    // with this refresh, rather than start another scan.
+                                    self.relist(&mut child, &path, depth + 1)?;
+                                    child
+                                };
+                            node.children.push(child);
+                        }
+                        Classified::Entry(child) => {
+                            if let Some((_, id)) = child.inode {
+                                self.touched.insert(id);
+                            }
+                            node.children.push(child);
+                        }
+                        Classified::Skipped => {}
+                        Classified::Unreadable => node.read_error = true,
+                    }
+                }
+            }
+            Err(error) => {
+                node.read_error = true;
+                self.context.progress.record_error(path, &error);
+            }
+        }
+        // Removing the charged name must refresh every remaining alias.
+        for removed in old.values() {
+            self.touch_removed(removed)?;
+        }
+        Some(())
+    }
+
+    fn child_path(&self, parent: &Path, child: &Node) -> Option<PathBuf> {
+        if !child.name.contains('\u{fffd}') {
+            return Some(parent.join(&*child.name));
+        }
+        // Display names lose unpaired UTF-16 surrogates. Recover the native
+        // name by identity only when a changed chain must enter that folder.
+        super::list(parent, self.context.volume.get().copied())
+            .ok()?
+            .filter_map(Result::ok)
+            .find(|entry| entry.identity() == child.inode)
+            .map(|entry| entry.path(parent))
+    }
+
+    fn touch_removed(&mut self, node: &Node) -> Option<()> {
+        if node.is_dir() {
+            for child in &node.children {
+                self.touch_removed(child)?;
+            }
+        } else if let Some((_, id)) = node.inode {
+            self.touched.insert(id);
+            if self.touched.len() > MAX_CHANGES {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    fn settle(&self, node: &mut Node, seen: &mut FxHashSet<u64>) -> bool {
+        let mut dirty = node
+            .inode
+            .is_some_and(|(_, id)| self.refreshed.contains(&id));
+        for child in &mut node.children {
+            if child.is_dir() {
+                dirty |= self.settle(child, seen);
+            } else if let Some((_, id)) = child.inode
+                && self.touched.contains(&id)
+            {
+                if self.context.options.dedup_hardlinks && !seen.insert(id) {
+                    child.own_bytes = 0;
+                }
+                settle_leaf(child, None);
+            }
+        }
+        if dirty {
+            settle_directory(node, self.context.options.metric);
+        }
+        dirty
+    }
 }
 
 #[cfg(test)]

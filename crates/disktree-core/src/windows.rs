@@ -253,6 +253,19 @@ pub fn read_dir(dir: &Path, volume: Option<u64>) -> io::Result<ReadDir> {
     Ok(ReadDir { source })
 }
 
+impl ReadDir {
+    /// Identity of the open directory, without opening its path a second
+    /// time. A standard fallback listing has no handle or reliable ids.
+    pub fn identity(&self) -> Option<(u64, u64)> {
+        let Source::Records(records) = &self.source else {
+            return None;
+        };
+        let info = winapi_util::file::information(&records.handle).ok()?;
+        let id = info.file_index();
+        (id != 0 && id != u64::MAX).then(|| (info.volume_serial_number(), id))
+    }
+}
+
 impl Iterator for ReadDir {
     type Item = io::Result<Entry>;
 
