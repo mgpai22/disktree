@@ -231,21 +231,55 @@ pub fn classify(root: &mut Node) {
     root.reclaim = None;
     for index in 0..root.children.len() {
         let siblings = &root.children;
-        let has_sibling =
-            |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
         let child = &siblings[index];
-        // A top-level directory with an unknown name takes the kind of its
-        // largest recognisable child: `~/world` is mostly `.git`.
-        let category = category_of_name(&child.name)
-            .or_else(|| is_git_store(child).then_some(Category::Git))
-            .or_else(|| dominant_child_category(child))
-            .unwrap_or(Category::Other);
-        let reclaim = child
-            .is_dir()
-            .then(|| reclaim_of(&child.name, Category::Other, has_sibling))
-            .flatten();
+        let (category, reclaim) = top_level_kind(
+            &child.name,
+            child.is_dir(),
+            || is_git_store(child),
+            || dominant_child_category(child),
+            |wanted| siblings.iter().any(|name| &*name.name == wanted),
+        );
         classify_below(&mut root.children[index], category, reclaim, 1);
     }
+}
+
+/// What an entry directly beneath the scanned root is: its own name, the
+/// shape of a git store, or, for a directory with an unknown name, the
+/// kind of its largest recognisable child (`~/world` is mostly `.git`).
+/// The rule for every tree: see also the file table reader's.
+pub(crate) fn top_level_kind(
+    name: &str,
+    is_dir: bool,
+    is_git: impl FnOnce() -> bool,
+    dominant: impl FnOnce() -> Option<Category>,
+    has_sibling: impl Fn(&str) -> bool,
+) -> (Category, Option<Reclaim>) {
+    let category = category_of_name(name)
+        .or_else(|| is_git().then_some(Category::Git))
+        .or_else(dominant)
+        .unwrap_or(Category::Other);
+    let reclaim = is_dir
+        .then(|| reclaim_of(name, Category::Other, has_sibling))
+        .flatten();
+    (category, reclaim)
+}
+
+/// What a directory deeper down is, given what holds it: its own name
+/// wins, then the shape of a git store, otherwise it inherits. Reclaimable
+/// space is inherited, or judged from its name and its siblings'.
+pub(crate) fn directory_kind(
+    name: &str,
+    is_git: impl FnOnce() -> bool,
+    has_sibling: impl Fn(&str) -> bool,
+    category: Category,
+    reclaim: Option<Reclaim>,
+) -> (Category, Option<Reclaim>) {
+    let child_category = category_of_name(name)
+        .or_else(|| is_git().then_some(Category::Git))
+        .unwrap_or(category);
+    let child_reclaim =
+        reclaim.or_else(|| reclaim_of(name, category, has_sibling));
+    (child_category, child_reclaim)
 }
 
 fn classify_below(
@@ -303,14 +337,13 @@ fn kind_of(
     if !child.is_dir() {
         return (category, reclaim);
     }
-    let has_sibling =
-        |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
-    let child_category = category_of_name(&child.name)
-        .or_else(|| is_git_store(child).then_some(Category::Git))
-        .unwrap_or(category);
-    let child_reclaim =
-        reclaim.or_else(|| reclaim_of(&child.name, category, has_sibling));
-    (child_category, child_reclaim)
+    directory_kind(
+        &child.name,
+        || is_git_store(child),
+        |wanted| siblings.iter().any(|name| &*name.name == wanted),
+        category,
+        reclaim,
+    )
 }
 
 /// The kind of an unknown directory, from what fills it: the first
@@ -334,12 +367,16 @@ fn dominant_child_category(node: &Node) -> Option<Category> {
     None
 }
 
-/// A git object store by its shape, whatever it is called: a bare
+/// The entries a git object store holds, whatever it is called: a bare
 /// repository, or a `.git` directory, has `objects`, `refs` and `HEAD`.
+pub(crate) const GIT_STORE: [&str; 3] = ["objects", "refs", "HEAD"];
+
+/// A git object store by its shape: see [`GIT_STORE`].
 pub fn is_git_store(node: &Node) -> bool {
-    let has =
-        |wanted: &str| node.children.iter().any(|child| &*child.name == wanted);
-    node.is_dir() && has("objects") && has("refs") && has("HEAD")
+    node.is_dir()
+        && GIT_STORE.iter().all(|wanted| {
+            node.children.iter().any(|child| &*child.name == *wanted)
+        })
 }
 
 #[cfg(test)]
