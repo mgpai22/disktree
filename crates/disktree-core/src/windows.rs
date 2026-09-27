@@ -484,7 +484,6 @@ pub fn current_file(
     expected: (u64, u64),
     apparent: bool,
 ) -> Option<(u64, i64)> {
-    const STANDARD: usize = size_of::<FILE_STANDARD_INFO>();
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -497,31 +496,8 @@ pub fn current_file(
     {
         return None;
     }
-    // Read as words rather than as the struct: its flags are `bool`s, and
-    // a byte the kernel wrote need not be a valid one. The directory flag
-    // is not needed; the attributes above already said.
-    let mut standard = [0_u64; STANDARD.div_ceil(8)];
-    // SAFETY: the handle is open and owned by `file`; the pointer and
-    // length describe `standard`, writable for at least `STANDARD` bytes
-    // and 8-byte aligned as the struct needs, and not otherwise borrowed
-    // during the call.
-    let filled = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            FileStandardInfo,
-            standard.as_mut_ptr().cast(),
-            STANDARD as u32,
-        )
-    };
-    if filled == 0 {
-        return None;
-    }
-    let size_at = if apparent {
-        offset_of!(FILE_STANDARD_INFO, EndOfFile)
-    } else {
-        offset_of!(FILE_STANDARD_INFO, AllocationSize)
-    };
-    let bytes = bytes_from(standard[size_at / 8].cast_signed());
+    let (length, allocated) = standard_sizes(&file).ok()?;
+    let bytes = if apparent { length } else { allocated };
     let modified = info
         .last_write_time()
         .and_then(|ticks| i64::try_from(ticks).ok())
@@ -997,20 +973,36 @@ pub fn sizes_by_id(volume: &File, reference: u64) -> io::Result<(u64, u64)> {
     // SAFETY: a handle just opened and owned by nothing else; `File`
     // closes it.
     let file = unsafe { File::from_raw_handle(handle) };
-    let mut info = FILE_STANDARD_INFO::default();
-    // SAFETY: `info` is live and as large as the length passed.
+    standard_sizes(&file)
+}
+
+fn standard_sizes(file: &File) -> io::Result<(u64, u64)> {
+    const SIZE: usize = size_of::<FILE_STANDARD_INFO>();
+    // The trailing flags in FILE_STANDARD_INFO are Rust bools; receive
+    // kernel bytes into integers instead, so no invalid bool is made.
+    let mut info = [0_u64; SIZE.div_ceil(8)];
+    // SAFETY: the live file handle fills a writable, aligned buffer of
+    // at least SIZE bytes. No other reference uses it during the call.
     let ok = unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle(),
             FileStandardInfo,
-            (&raw mut info).cast(),
-            size_of::<FILE_STANDARD_INFO>() as u32,
+            info.as_mut_ptr().cast(),
+            SIZE as u32,
         )
     };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((bytes_from(info.EndOfFile), bytes_from(info.AllocationSize)))
+    Ok((
+        bytes_from(
+            info[offset_of!(FILE_STANDARD_INFO, EndOfFile) / 8].cast_signed(),
+        ),
+        bytes_from(
+            info[offset_of!(FILE_STANDARD_INFO, AllocationSize) / 8]
+                .cast_signed(),
+        ),
+    ))
 }
 
 /// Bytes aligned to a page, for reads that bypass the file cache: those
