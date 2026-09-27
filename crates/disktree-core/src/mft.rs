@@ -98,7 +98,7 @@ const EVICTED: u32 =
     FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
 
 /// What one base file record says.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Info {
     in_use: bool,
     directory: bool,
@@ -199,7 +199,7 @@ pub fn scan(
         .map(|dir| snapshot::file(dir, letter));
     let journal = file.as_ref().and_then(|_| snapshot::query(&volume));
     let resumed = file.as_deref().zip(journal).and_then(|(file, journal)| {
-        snapshot::resume(&volume, &geometry, journal, file, options)
+        snapshot::resume(&path, &volume, &geometry, journal, file, options)
     });
     if let Some(flat) = resumed {
         return finished(
@@ -249,7 +249,7 @@ pub fn scan(
         seen: options.dedup_hardlinks.then(Seen::new),
     };
     let tree = table.build().and_then(|mut flat| {
-        flat.classify();
+        flat.classify(&[]);
         let tree = flat.tree(crate::scan::file_name(root), progress);
         match (file, checkpoint) {
             (Some(file), Some(checkpoint))
@@ -1170,7 +1170,7 @@ mod tests {
     /// The tree a table makes, the way a scan makes it.
     fn tree_of(table: &Table<'_>) -> Result<Node, Stop> {
         let mut flat = table.build()?;
-        flat.classify();
+        flat.classify(&[]);
         flat.tree("C:".into(), table.progress)
     }
 

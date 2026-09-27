@@ -1,13 +1,16 @@
 //! Keeping a scan's finished tree for the next one: the flat tree a whole
 //! read made, written to a file in the scan's cache directory, with where
 //! the volume's change journal stood when the read began. The next scan
-//! starts from it when the journal names no change since.
+//! starts from it: the journal names every file changed since, and only
+//! those records are read again, from NTFS itself rather than the disk,
+//! so they are as current as the file system is; `flat.rs` takes them
+//! into the tree.
 //!
 //! Anything that does not line up gives up and reads the whole table: no
 //! journal, another journal (it was deleted and made again), a kept tree
-//! of another format, volume, record size or scan options, one that
-//! fails its checksum or is not a tree, or a journal that has since
-//! dropped the changes wanted.
+//! of another format, volume, record size or scan options, or one that
+//! fails its checksum or is not a tree, a journal that has since dropped
+//! the changes wanted, or changes the kept tree cannot take in.
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
@@ -16,13 +19,16 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use windows_sys::Win32::System::Ioctl::{
-    FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
+    FSCTL_GET_NTFS_FILE_RECORD, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
 };
 
-use super::flat::{Dir, Flat, Item, NONE};
-use super::{Geometry, REFERENCE, ReadExact as _, u16_at, u32_at, u64_at};
+use super::flat::{Dir, Flat, Fresh, Item, NONE};
+use super::{
+    ATTRIBUTE_LIST, Entry, Geometry, Info, Parsed, REFERENCE, ReadExact as _,
+    attributes, open_volume, parse_fixed, u16_at, u32_at, u64_at,
+};
 use crate::scan::ScanOptions;
 use crate::tree::Metric;
 use crate::windows::control;
@@ -117,19 +123,144 @@ fn changes(
     }
 }
 
-/// The last scan's tree, when the journal names no file changed since;
-/// `None` when a whole read is needed instead.
+/// The last scan's tree brought up to date; `None` when a whole read is
+/// needed instead.
 pub(super) fn resume(
+    path: &str,
     volume: &File,
     geometry: &Geometry,
     journal: Journal,
     file: &Path,
     options: &ScanOptions,
 ) -> Option<Flat> {
-    let (flat, checkpoint) = load(file, geometry, journal, key(options))?;
+    let (mut flat, checkpoint) = load(file, geometry, journal, key(options))?;
     let (files, _) = changes(volume, journal, checkpoint.next)?;
-    files.is_empty().then_some(flat)
+    let mut numbers: Vec<u32> = files.into_iter().collect();
+    numbers.sort_unstable();
+    let fresh = fresh(&read_again(path, geometry, &numbers)?);
+    let touched = flat.patch(&numbers, &fresh, options)?;
+    flat.classify(&touched);
+    Some(flat)
 }
+
+/// What re-reading `numbers` found: per list, the base records' facts and
+/// the rest parsed, the list's place its chunk number.
+type Lists = Vec<(Vec<(u32, Info)>, Parsed)>;
+
+/// Every record of `numbers` as NTFS holds it now.
+fn read_again(
+    path: &str,
+    geometry: &Geometry,
+    numbers: &[u32],
+) -> Option<Lists> {
+    let volume = open_volume(path).ok()?;
+    let mut out = Parsed::default();
+    let mut bases = Vec::with_capacity(numbers.len());
+    let mut buffer = Vec::new();
+    for &number in numbers {
+        if let Some(info) =
+            reparse(&volume, geometry, number, 0, &mut buffer, &mut out).ok()?
+        {
+            bases.push((number, info));
+        }
+    }
+    Some(vec![(bases, out)])
+}
+/// What each record re-read holds.
+fn fresh(lists: &Lists) -> FxHashMap<u32, Fresh> {
+    let mut fresh: FxHashMap<u32, Fresh> = lists
+        .iter()
+        .flat_map(|(bases, _)| bases)
+        .map(|&(number, info)| {
+            (
+                number,
+                Fresh {
+                    info,
+                    names: Vec::new(),
+                },
+            )
+        })
+        .collect();
+    let text = |out: &Parsed, entry: &Entry| {
+        let at = entry.at as usize;
+        out.text
+            .get(at..at + usize::from(entry.len))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    for (_, out) in lists {
+        for entry in &out.names {
+            if let Some(record) = fresh.get_mut(&entry.child) {
+                let name = text(out, entry);
+                record
+                    .names
+                    .push((entry.parent, entry.parent_sequence, name));
+            }
+        }
+    }
+    fresh
+}
+
+/// Parse file `number` as NTFS holds it now into `out`: its base record's
+/// facts, or `None` when the record is free or is itself another file's
+/// extension, which its base file carries.
+fn reparse(
+    volume: &File,
+    geometry: &Geometry,
+    number: u32,
+    chunk: u32,
+    buffer: &mut Vec<u8>,
+    out: &mut Parsed,
+) -> io::Result<Option<Info>> {
+    let Some(base) = fetch(volume, geometry, number, buffer)? else {
+        return Ok(None);
+    };
+    if u64_at(&base, 0x20).unwrap_or(0) & REFERENCE != 0 {
+        return Ok(None);
+    }
+    let mut info = Info::default();
+    parse_fixed(&base, number, chunk, out, &mut info);
+    if !info.in_use {
+        return Ok(None);
+    }
+    // A file spread over extension records is for a whole read.
+    if attributes(&base).any(|attribute| attribute.kind == ATTRIBUTE_LIST) {
+        return Err(io::Error::other("an attribute list"));
+    }
+    Ok(Some(info))
+}
+
+/// Record `number` as NTFS holds it now, which the disk may not yet;
+/// `None` when it is not in use. NTFS hands it over with its update
+/// sequence already undone.
+fn fetch(
+    volume: &File,
+    geometry: &Geometry,
+    number: u32,
+    buffer: &mut Vec<u8>,
+) -> io::Result<Option<Vec<u8>>> {
+    // NTFS_FILE_RECORD_OUTPUT_BUFFER: reference, length, record.
+    const AT: usize = 12;
+    buffer.resize(AT + geometry.record, 0);
+    let input = u64::from(number).to_le_bytes();
+    let len = control(volume, FSCTL_GET_NTFS_FILE_RECORD, &input, buffer)?;
+    let out = buffer.get(..len).unwrap_or_default();
+    // A free record gives the nearest in-use one below it instead.
+    let (Some(reference), Some(length)) = (u64_at(out, 0), u32_at(out, 8))
+    else {
+        return Err(io::Error::other("short file record"));
+    };
+    if reference & REFERENCE != u64::from(number) {
+        return Ok(None);
+    }
+    match out.get(AT..AT + length as usize) {
+        Some(record) if record.len() == geometry.record => {
+            Ok(Some(record.to_vec()))
+        }
+        _ => Err(io::Error::other("unexpected file record length")),
+    }
+}
+
 /// A kept tree being written, which a scan waits for before it reads one.
 static SAVING: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 

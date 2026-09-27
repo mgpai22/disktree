@@ -1,13 +1,19 @@
-//! The tree as flat arrays: what a read of the file table shows,
-//! totalled, ordered and classified, in a form that is cheap to keep and
-//! to turn into [`Node`]s.
+//! The finished tree as flat arrays: what a read of the file table shows,
+//! totalled, ordered and classified, in a form that is cheap to keep on
+//! disk, to change in place and to turn into [`Node`]s.
 //!
 //! Every directory is a [`Dir`] and its entries a run of [`Item`]s, in the
-//! order the tree shows them; names sit in one arena.
+//! order the tree shows them; names sit in one arena. The next scan loads
+//! it, replaces the entries of the files the change journal names, totals
+//! and orders again only the directories that hold a change and those
+//! above them, and decides kinds again only where a change can reach: a
+//! journal of a few thousand changes costs thousands of steps, not the
+//! millions a tree built from the table again would.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
 };
@@ -138,6 +144,14 @@ pub(super) struct Flat {
     pub items: Vec<Item>,
     /// Names, as UTF-8.
     pub text: Vec<u8>,
+}
+
+/// A file record as NTFS holds it now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Fresh {
+    pub info: Info,
+    /// Every name: `(parent, parent's sequence number, name)`.
+    pub names: Vec<(u32, u16, String)>,
 }
 
 /// Whether a scan with `options` leaves the name out, as the walk does.
@@ -359,10 +373,16 @@ impl Flat {
         }
     }
 
-    /// Decide what directories are, as `classify::classify` would, in a
-    /// tree whose kinds are all unset. The root's entries are decided
-    /// first: one takes the kind of its largest child.
-    pub(super) fn classify(&mut self) {
+    /// Decide what directories are, as `classify::classify` would: every
+    /// one in a tree just built, whose kinds are all unset; afterwards
+    /// only where a change can reach. That is a directory `touched` marks
+    /// (its entries changed, or some beneath it did), whose entries' kinds
+    /// may follow their new siblings, and every directory whose kind came
+    /// out other than before, whose entries inherit it. Beneath any other,
+    /// nothing the kinds depend on changed. The root's entries are always
+    /// decided again: one takes the kind of its largest child, and sizes
+    /// anywhere beneath can change which that is.
+    pub(super) fn classify(&mut self, touched: &[bool]) {
         let Some(&root) = self.dirs.first() else {
             return;
         };
@@ -379,7 +399,13 @@ impl Flat {
                     |wanted| self.has(run, wanted),
                 );
                 let mut kinds = Vec::new();
-                self.kinds(item.value, code(category, reclaim), 1, &mut kinds);
+                self.kinds(
+                    item.value,
+                    code(category, reclaim),
+                    touched,
+                    1,
+                    &mut kinds,
+                );
                 kinds
             })
             .collect();
@@ -396,11 +422,12 @@ impl Flat {
     }
 
     /// Directory `index` is of `kind` now: note it in `out` if that is new,
-    /// and go on beneath it if so.
+    /// and go on beneath it where [`Flat::classify`] says to.
     fn kinds(
         &self,
         index: u64,
         kind: Kind,
+        touched: &[bool],
         depth: usize,
         out: &mut Vec<(u64, Kind)>,
     ) {
@@ -411,7 +438,12 @@ impl Flat {
         if changed {
             out.push((index, kind));
         }
-        if !changed || depth >= MOST_LEVELS {
+        let here = usize::try_from(index)
+            .ok()
+            .and_then(|index| touched.get(index))
+            .copied()
+            .unwrap_or(false);
+        if !changed && !here || depth >= MOST_LEVELS {
             return;
         }
         let (category, reclaim) = decode(kind);
@@ -427,11 +459,236 @@ impl Flat {
                 category,
                 reclaim,
             );
-            self.kinds(item.value, code(category, reclaim), depth + 1, out);
+            self.kinds(
+                item.value,
+                code(category, reclaim),
+                touched,
+                depth + 1,
+                out,
+            );
         };
         for item in run {
             child(item, out);
         }
+    }
+
+    /// Bring the tree up to date: `numbers` are the records that changed,
+    /// sorted, and `fresh` what those still in use hold now. Totals and order
+    /// come up to date too; kinds are left to [`Flat::classify`], given what
+    /// this returns: the directories whose entries changed and every one
+    /// above them. `None` when a change reaches a directory, which only a
+    /// whole read takes in yet, or the changes do not make a tree.
+    pub(super) fn patch(
+        &mut self,
+        numbers: &[u32],
+        fresh: &FxHashMap<u32, Fresh>,
+        options: &ScanOptions,
+    ) -> Option<Vec<bool>> {
+        // The root and the file system's own records are never entries.
+        let numbers: Vec<u32> = numbers
+            .iter()
+            .copied()
+            .filter(|&number| number >= FIRST_USER_RECORD)
+            .collect();
+        if numbers.iter().any(|number| {
+            fresh.get(number).is_some_and(|fresh| fresh.info.directory)
+        }) {
+            return None;
+        }
+        let changed = Bits::of(&numbers);
+        let parents: FxHashSet<u32> = numbers
+            .iter()
+            .filter_map(|number| fresh.get(number))
+            .flat_map(|fresh| fresh.names.iter().map(|&(parent, ..)| parent))
+            .collect();
+
+        // The directory each changed record, and each parent a name
+        // names, was.
+        let found: Vec<(u32, u32)> = self
+            .dirs
+            .par_iter()
+            .enumerate()
+            .filter(|(_, dir)| {
+                dir.is_live()
+                    && (changed.has(dir.record)
+                        || parents.contains(&dir.record))
+            })
+            .map(|(index, dir)| (dir.record, index as u32))
+            .collect();
+        let mut dir_of = FxHashMap::default();
+        for (record, index) in found {
+            if changed.has(record) || dir_of.insert(record, index).is_some() {
+                return None;
+            }
+        }
+
+        // The entries changed records had, by where they are.
+        let old: Vec<(u32, u32)> = self
+            .dirs
+            .par_iter()
+            .enumerate()
+            .filter(|(_, dir)| dir.is_live())
+            .flat_map_iter(|(index, dir)| {
+                let first = dir.first;
+                self.run(*dir)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| changed.has(item.record))
+                    .map(move |(at, _)| (index as u32, first + at as u32))
+            })
+            .collect();
+        let mut dirty: FxHashSet<u32> =
+            old.iter().map(|&(dir, _)| dir).collect();
+        let removed: FxHashSet<u32> = old.iter().map(|&(_, at)| at).collect();
+
+        // The entries changed records have now, as the build makes them.
+        let mut added: FxHashMap<u32, Vec<Item>> = FxHashMap::default();
+        for &number in &numbers {
+            let Some(Fresh { info, names }) = fresh.get(&number) else {
+                continue;
+            };
+            if !info.in_use {
+                continue;
+            }
+            let mut charged = false;
+            for (parent, parent_sequence, name) in names {
+                if *parent == number || hidden(options, name, info) {
+                    continue;
+                }
+                let Some(&holder) = dir_of.get(parent) else {
+                    continue;
+                };
+                if self.dirs[holder as usize].sequence != *parent_sequence {
+                    continue;
+                }
+                let mut size = if options.apparent_size {
+                    info.apparent
+                } else {
+                    info.allocated
+                };
+                let shared = info.names > 1;
+                // One of a hardlinked file's names weighs, as the build
+                // charges the first it meets.
+                if options.dedup_hardlinks && shared && size > 0 {
+                    if charged {
+                        size = 0;
+                    }
+                    charged = true;
+                }
+                let mut item = Item {
+                    record: number,
+                    sequence: info.sequence,
+                    kind: if is_link(info) { LINK } else { FILE },
+                    shared,
+                    value: size,
+                    modified: info.modified,
+                    ..Item::default()
+                };
+                name_into(&mut self.text, &mut item, name).ok()?;
+                added.entry(holder).or_default().push(item);
+                dirty.insert(holder);
+            }
+        }
+
+        // Each changed directory's entries again, as a run of their own
+        // after the others: what it kept, then what it gained.
+        let mut dirty: Vec<u32> = dirty
+            .into_iter()
+            .filter(|&index| {
+                self.dirs.get(index as usize).is_some_and(Dir::is_live)
+            })
+            .collect();
+        dirty.sort_unstable();
+        for &index in &dirty {
+            let dir = self.dirs[index as usize];
+            let first = u32::try_from(self.items.len()).ok()?;
+            for at in dir.first..dir.first.saturating_add(dir.len) {
+                if !removed.contains(&at)
+                    && let Some(&item) = self.items.get(at as usize)
+                {
+                    self.items.push(item);
+                }
+            }
+            self.items.extend(added.remove(&index).unwrap_or_default());
+            let len = u32::try_from(self.items.len()).ok()? - first;
+            let dir = &mut self.dirs[index as usize];
+            dir.first = first;
+            dir.len = len;
+        }
+
+        // Totals and order again for each changed directory and those
+        // above it, deepest first, so each totals children already done.
+        let mut touched = vec![false; self.dirs.len()];
+        let mut chain = Vec::new();
+        for &index in &dirty {
+            let mut at = index;
+            while let Some(flag) = touched.get_mut(at as usize)
+                && !*flag
+            {
+                *flag = true;
+                chain.push(at);
+                at = self.dirs[at as usize].parent;
+            }
+        }
+        let depth = |mut at: u32| {
+            let mut depth = 0;
+            while let Some(dir) = self.dirs.get(at as usize)
+                && depth <= MOST_LEVELS
+            {
+                at = dir.parent;
+                depth += 1;
+            }
+            depth
+        };
+        let mut chain: Vec<(usize, u32)> = chain
+            .into_iter()
+            .map(|index| (depth(index), index))
+            .collect();
+        chain.sort_unstable_by(|left, right| right.cmp(left));
+        for (_, index) in chain {
+            self.settle(index, options.metric);
+        }
+        Some(touched)
+    }
+
+    /// Total directory `index` from its entries, and order them.
+    fn settle(&mut self, index: u32, metric: Metric) {
+        let Some(&dir) = self.dirs.get(index as usize) else {
+            return;
+        };
+        let mut total = Dir {
+            bytes: 0,
+            files: 0,
+            dirs: 1,
+            modified: 0,
+            ..dir
+        };
+        for item in self.run(dir) {
+            total.add(self.totals(item));
+        }
+        self.dirs[index as usize] = total;
+        let Self { dirs, items, text } = self;
+        let (dirs, text): (&[Dir], &[u8]) = (dirs, text);
+        let start = dir.first as usize;
+        let Some(run) = items.get_mut(start..start + dir.len as usize) else {
+            return;
+        };
+        let key = |item: &Item| {
+            if item.kind == DIRECTORY {
+                dirs.get(item.value as usize)
+                    .map_or(0, |dir| dir.key(metric))
+            } else {
+                item.key(metric)
+            }
+        };
+        // Stable, which takes a run still nearly in order, as most are
+        // after a few changes, in close to one pass.
+        run.sort_by(|left, right| {
+            order(
+                (key(left), name_of(text, left)),
+                (key(right), name_of(text, right)),
+            )
+        });
     }
 
     /// Whether this is a tree: every run and name in bounds, every
@@ -481,6 +738,26 @@ impl Flat {
                         }
                 })
             })
+    }
+}
+
+/// Record numbers, a bit each: tested for every entry of the tree.
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn of(numbers: &[u32]) -> Self {
+        let top = numbers.iter().max().map_or(0, |&top| top as usize + 1);
+        let mut bits = vec![0_u64; top.div_ceil(64)];
+        for &number in numbers {
+            bits[number as usize / 64] |= 1 << (number % 64);
+        }
+        Self(bits)
+    }
+
+    fn has(&self, number: u32) -> bool {
+        self.0
+            .get(number as usize / 64)
+            .is_some_and(|word| word & (1 << (number % 64)) != 0)
     }
 }
 
@@ -646,5 +923,236 @@ impl Table<'_> {
         flat.items
             .extend(scratch.drain(start..).map(|(_, item)| item));
         Ok(index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+    use crate::tree::Seen;
+
+    /// A volume: what each record in use holds, the root's (5, at
+    /// sequence 5) aside.
+    type Volume = BTreeMap<u32, Fresh>;
+
+    fn dir(sequence: u16, (parent, at): (u32, u16), name: &str) -> Fresh {
+        Fresh {
+            info: Info {
+                in_use: true,
+                directory: true,
+                sequence,
+                names: 1,
+                ..Info::default()
+            },
+            names: vec![(parent, at, name.to_owned())],
+        }
+    }
+
+    fn file(sequence: u16, names: &[(u32, u16, &str)], size: u64) -> Fresh {
+        Fresh {
+            info: Info {
+                in_use: true,
+                sequence,
+                names: names.len() as u8,
+                apparent: size,
+                allocated: size.next_multiple_of(4096),
+                modified: size.cast_signed() % 1000,
+                ..Info::default()
+            },
+            names: names
+                .iter()
+                .map(|&(parent, at, name)| (parent, at, name.to_owned()))
+                .collect(),
+        }
+    }
+
+    fn table<'a>(
+        volume: &Volume,
+        options: &'a ScanOptions,
+        progress: &'a ScanProgress,
+    ) -> Table<'a> {
+        let top = volume.keys().max().map_or(0, |&top| top as usize) + 1;
+        let mut infos = vec![Info::default(); top.max(ROOT as usize + 1)];
+        infos[ROOT as usize] = Info {
+            in_use: true,
+            directory: true,
+            sequence: 5,
+            ..Info::default()
+        };
+        let mut text = String::new();
+        let mut names = Vec::new();
+        for (&child, fresh) in volume {
+            infos[child as usize] = fresh.info;
+            for (parent, parent_sequence, name) in &fresh.names {
+                names.push(Entry {
+                    parent: *parent,
+                    parent_sequence: *parent_sequence,
+                    child,
+                    chunk: 0,
+                    at: text.len() as u32,
+                    len: name.len() as u16,
+                });
+                text.push_str(name);
+            }
+        }
+        names.sort_by_key(|entry| entry.parent);
+        let starts = super::super::starts(&names, infos.len());
+        Table {
+            infos,
+            names,
+            texts: vec![text],
+            starts,
+            options,
+            progress,
+            seen: options.dedup_hardlinks.then(Seen::new),
+        }
+    }
+
+    /// The tree a whole read of `volume` makes.
+    fn built(volume: &Volume, options: &ScanOptions) -> Flat {
+        let progress = ScanProgress::default();
+        let table = table(volume, options, &progress);
+        let Ok(mut flat) = table.build() else {
+            panic!("the table makes a tree");
+        };
+        flat.classify(&[]);
+        assert!(flat.is_valid());
+        flat
+    }
+    /// `flat`, the tree of `before`, brought up to `after` the way a
+    /// resumed scan does: the journal names what differs.
+    fn patch(
+        flat: &mut Flat,
+        before: &Volume,
+        after: &Volume,
+        options: &ScanOptions,
+    ) -> Option<()> {
+        let numbers: Vec<u32> = before
+            .keys()
+            .chain(after.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|number| before.get(number) != after.get(number))
+            .collect();
+        let fresh: FxHashMap<u32, Fresh> = numbers
+            .iter()
+            .filter_map(|&number| Some((number, after.get(&number)?.clone())))
+            .collect();
+        let touched = flat.patch(&numbers, &fresh, options)?;
+        flat.classify(&touched);
+        Some(())
+    }
+
+    /// Every node as a line, in order: its path and all it says. Checks
+    /// on the way that the kinds are what `classify` makes of the tree.
+    fn lines(flat: &Flat) -> Vec<String> {
+        let progress = ScanProgress::default();
+        let Ok(root) = flat.tree("C:".into(), &progress) else {
+            panic!("the tree turns into nodes");
+        };
+        let mut again = root.clone();
+        crate::classify::classify(&mut again);
+        let mut out = Vec::new();
+        describe(&root, "", &mut out);
+        let mut expected = Vec::new();
+        describe(&again, "", &mut expected);
+        assert_eq!(out, expected, "kinds as `classify` decides them");
+        out
+    }
+
+    fn describe(node: &Node, path: &str, out: &mut Vec<String>) {
+        out.push(format!(
+            "{path} {:?} {} {} {} {} {} {:?} {} {:?} {:?}",
+            node.kind,
+            node.bytes,
+            node.own_bytes,
+            node.files,
+            node.own_files,
+            node.dirs,
+            node.inode,
+            node.modified,
+            node.category,
+            node.reclaim
+        ));
+        for child in &node.children {
+            describe(child, &format!("{path}/{}", child.name), out);
+        }
+    }
+
+    fn exact() -> ScanOptions {
+        // Which name of a hardlinked file weighs is whichever the build
+        // meets first: compared exactly, each weighs.
+        ScanOptions {
+            dedup_hardlinks: false,
+            ..ScanOptions::default()
+        }
+    }
+
+    #[test]
+    fn hardlinks_counted_once_stay_counted_once_through_a_patch() {
+        let root = (ROOT, 5);
+        let before: Volume = [
+            (20, dir(1, root, "a")),
+            (21, dir(1, root, "b")),
+            (30, file(1, &[(20, 1, "x"), (21, 1, "x")], 8192)),
+            (31, file(1, &[(20, 1, "y")], 4096)),
+        ]
+        .into_iter()
+        .collect();
+        let mut after = before.clone();
+        after.insert(31, file(1, &[(20, 1, "y"), (21, 1, "y")], 4096));
+        after.insert(30, file(1, &[(20, 1, "x"), (21, 1, "x")], 16384));
+        let options = ScanOptions::default();
+        let mut flat = built(&before, &options);
+        patch(&mut flat, &before, &after, &options).expect("patched");
+        let root = flat.tree("C:".into(), &ScanProgress::default());
+        let root = root.unwrap_or_else(|_| panic!("a tree"));
+        assert_eq!((root.bytes, root.files), (16384 + 4096, 4));
+    }
+
+    #[test]
+    fn patching_changed_files_gives_what_a_whole_read_would() {
+        let root = (ROOT, 5);
+        let before: Volume = [
+            (20, dir(1, root, "src")),
+            (21, dir(1, (20, 1), "rust-thing")),
+            (22, file(1, &[(21, 1, "out.bin")], 5000)),
+            (23, file(1, &[(20, 1, "gone.txt")], 10)),
+            (24, file(1, &[(5, 5, "notes.txt")], 300)),
+            (25, file(1, &[(21, 1, "moving")], 999)),
+            (26, file(1, &[(20, 1, "linked"), (21, 1, "linked")], 7000)),
+        ]
+        .into_iter()
+        .collect();
+        let mut after = before.clone();
+        // Grown, gone, renamed, moved, one name fewer, and made since: a
+        // manifest that makes `rust-thing` code with build output.
+        after.insert(22, file(1, &[(21, 1, "out.bin")], 90_000));
+        after.remove(&23);
+        after.insert(24, file(1, &[(5, 5, "notes.md")], 300));
+        after.insert(25, file(1, &[(20, 1, "moving")], 999));
+        after.insert(26, file(1, &[(20, 1, "linked")], 7000));
+        after.insert(27, file(1, &[(21, 1, "Cargo.toml")], 1));
+        for options in [
+            exact(),
+            ScanOptions {
+                metric: Metric::Files,
+                apparent_size: true,
+                ..exact()
+            },
+        ] {
+            let mut flat = built(&before, &options);
+            patch(&mut flat, &before, &after, &options).expect("patched");
+            assert_eq!(lines(&flat), lines(&built(&after, &options)));
+            assert!(flat.is_valid());
+        }
+        // A directory changed is for a whole read.
+        let mut moved = before.clone();
+        moved.insert(21, dir(1, root, "rust-thing"));
+        let mut flat = built(&before, &exact());
+        assert!(patch(&mut flat, &before, &moved, &exact()).is_none());
     }
 }
