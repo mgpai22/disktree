@@ -329,27 +329,9 @@ fn aggregate_at(
     seen: Option<&Seen>,
 ) {
     if !node.is_dir() {
-        // Every name of a file has the file's size, so one that weighs
-        // nothing need not be remembered to be charged once.
-        if node.own_bytes > 0
-            && let Some(seen) = seen
-            && let Some(key) = node.inode
-            && !seen.insert(key)
-        {
-            node.own_bytes = 0;
-        }
-        node.bytes = node.own_bytes;
-        node.files = node.own_files;
-        node.dirs = 0;
+        settle_leaf(node, seen);
         return;
     }
-
-    let mut bytes = 0;
-    let mut files = 0;
-    let mut own_bytes = 0;
-    let mut own_files = 0;
-    let mut dirs: u64 = 1;
-    let mut modified = 0;
     if depth < PARALLEL_LEVELS {
         node.children
             .par_iter_mut()
@@ -359,6 +341,36 @@ fn aggregate_at(
             aggregate_at(child, metric, depth + 1, seen);
         }
     }
+    settle_directory(node, metric);
+}
+
+/// A leaf's totals: its own size and count, and no size at all when `seen`
+/// has charged the file under another name already. One step of
+/// [`aggregate`], for a tree built already settled.
+pub(crate) fn settle_leaf(node: &mut Node, seen: Option<&Seen>) {
+    // Every name of a file has the file's size, so one that weighs
+    // nothing need not be remembered to be charged once.
+    if node.own_bytes > 0
+        && let Some(seen) = seen
+        && let Some(key) = node.inode
+        && !seen.insert(key)
+    {
+        node.own_bytes = 0;
+    }
+    node.bytes = node.own_bytes;
+    node.files = node.own_files;
+    node.dirs = 0;
+}
+
+/// A directory's totals from its children's, which must be settled, and
+/// its children in `metric` order. The other step of [`aggregate`].
+pub(crate) fn settle_directory(node: &mut Node, metric: Metric) {
+    let mut bytes = 0;
+    let mut files = 0;
+    let mut own_bytes = 0;
+    let mut own_files = 0;
+    let mut dirs: u64 = 1;
+    let mut modified = 0;
     for child in &node.children {
         modified = modified.max(child.modified);
         // Saturating: a corrupt volume's file table can claim any size.
