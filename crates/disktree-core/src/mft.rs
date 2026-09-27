@@ -775,7 +775,20 @@ fn parse_record(
     out: &mut Parsed,
     slot: &mut Info,
 ) {
-    if bytes.get(..4) != Some(b"FILE") || fixup(bytes).is_none() {
+    if fixup(bytes).is_some() {
+        parse_fixed(bytes, number, chunk, out, slot);
+    }
+}
+
+/// [`parse_record`] for a record whose update sequence is already undone.
+fn parse_fixed(
+    bytes: &[u8],
+    number: u32,
+    chunk: u32,
+    out: &mut Parsed,
+    slot: &mut Info,
+) {
+    if bytes.get(..4) != Some(b"FILE") {
         return;
     }
     let Some(flags) = u16_at(bytes, 0x16) else {
