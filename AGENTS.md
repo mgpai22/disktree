@@ -114,6 +114,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
 | starting that read from the last one and the change journal | `crates/disktree-core/src/mft/snapshot.rs` |
 | the kept tree: built, changed in place, turned into nodes | `crates/disktree-core/src/mft/flat.rs` |
+| starting a folder walk from the last one and the change journal | `crates/disktree-core/src/walk_cache.rs`, `walk_cache/store.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |

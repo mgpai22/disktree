@@ -328,11 +328,27 @@ The same program, with Windows' answers to the questions above:
   differ from the kept tree's, when a folder whose contents the tree never
   held comes into view (a cloud folder made local), or a day after the
   last whole read.
-  Started without admin rights, disktree walks as before. On a whole NTFS
-  drive without `-l`, or once Windows refuses the walk a folder, the side
-  panel offers **Restart as Administrator**, which reopens the same folder
-  and options through the UAC prompt; during a widening scan, the wider
-  folder being scanned.
+  Without admin rights, an NTFS folder walk keeps a separate
+  `walk-*.bin` tree snapshot beside the MFT cache. The next launch reads
+  the unprivileged change journal, lists changed directories and all
+  cached hardlink aliases, and updates only the changed ancestor totals.
+  New or moved-in directories are walked. Corrupt caches, changed root or
+  journal IDs, journal gaps, more than 100,000 affected files or 10,000
+  directories, and snapshots older than a day cause a full walk. Network
+  shares, non-NTFS volumes, followed links and depth limits use the walk.
+  Known open writers and the 1,024 largest cached files also get a current
+  metadata query on every launch. This covers large long-running writers
+  such as a WSL disk image even when their old journal entries have expired.
+  This is a bounded rule, not a filesystem snapshot: an older writer below
+  that set can stay stale until close or the next full walk. Set
+  `ScanOptions::cache` to `None` when that limitation is unacceptable.
+  Hardlink names can report different stale directory-listing allocations,
+  so a fresh parallel walk can also assign a different byte count to the
+  same file depending on which name it charges first.
+  On a whole NTFS drive without `-l`, or once Windows refuses the walk a
+  folder, the side panel offers **Restart as Administrator**, which reopens
+  the same folder and options through the UAC prompt; during a widening
+  scan, the wider folder being scanned.
 - **Move to trash** is the Recycle Bin, through the shell, which asks
   before destroying anything it cannot recycle.
 - **Refused besides the rules below:** Windows, Program Files and
