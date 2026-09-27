@@ -320,6 +320,8 @@ The same program, with Windows' answers to the questions above:
   During that read, record facts use 256-record pages: stretches skipped
   as free have no record storage. File record numbers stay unchanged, so
   journal updates still find their records directly.
+  Each stored record uses 32 bytes, with full-width sizes and timestamps;
+  only the attribute facts that affect traversal are retained.
   The finished tree that read made is kept under
   `%LOCALAPPDATA%\disktree\admin` (about 280 MB for that drive),
   and the next launch or rescan starts from it: NTFS's change journal

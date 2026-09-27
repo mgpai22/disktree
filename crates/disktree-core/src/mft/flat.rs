@@ -20,14 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
-};
 
-use super::{
-    EVICTED, Entry, FIRST_USER_RECORD, Info, MOST_LEVELS, NAME_SURROGATE, ROOT,
-    Stop, Table,
-};
+use super::{Entry, FIRST_USER_RECORD, Info, MOST_LEVELS, ROOT, Stop, Table};
 use crate::scan::ScanOptions;
 use crate::tree::{
     Builder, DIRECTORY, Dir, FILE, IDENTIFIED, Item, LINK, NONE, Seg, Totals,
@@ -71,15 +65,7 @@ pub(super) struct Fresh {
 
 /// Whether a scan with `options` leaves the name out, as the walk does.
 fn hidden(options: &ScanOptions, name: &str, info: &Info) -> bool {
-    !options.include_hidden
-        && (name.starts_with('.')
-            || info.attributes & FILE_ATTRIBUTE_HIDDEN != 0)
-}
-
-/// Links, junctions and mounted folders: shown as links, not followed.
-const fn is_link(info: &Info) -> bool {
-    info.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        && info.reparse_tag & NAME_SURROGATE != 0
+    !options.include_hidden && (name.starts_with('.') || info.hidden)
 }
 
 /// Put `name` in `text` as `item`'s.
@@ -180,10 +166,7 @@ impl Tree {
             let Some(Fresh { info, .. }) = fresh.get(&number) else {
                 continue;
             };
-            if !info.in_use
-                || !info.directory
-                || is_link(info)
-                || info.attributes & EVICTED != 0
+            if !info.in_use || !info.directory || info.is_link() || info.evicted
             {
                 continue;
             }
@@ -217,8 +200,8 @@ impl Tree {
             let Some(Fresh { info, names }) = fresh.get(&number) else {
                 continue;
             };
-            let directory = info.directory && !is_link(info);
-            if !info.in_use || directory && info.attributes & EVICTED != 0 {
+            let directory = info.directory && !info.is_link();
+            if !info.in_use || directory && info.evicted {
                 continue;
             }
             let mut charged = false;
@@ -271,7 +254,7 @@ impl Tree {
                     }
                     Item {
                         id: reference(number, info.sequence),
-                        kind: if is_link(info) { LINK } else { FILE },
+                        kind: if info.is_link() { LINK } else { FILE },
                         flags: if shared { IDENTIFIED } else { 0 },
                         value: size,
                         modified: seconds(info.modified),
@@ -637,9 +620,9 @@ impl Table<'_> {
         if !info.in_use || hidden(self.options, self.name(entry), info) {
             return Ok(None);
         }
-        let link = is_link(info);
+        let link = info.is_link();
         if info.directory && !link {
-            if info.attributes & EVICTED != 0 || !descend {
+            if info.evicted || !descend {
                 return Ok(None);
             }
             return Ok(Some(Built::Directory(entry.child, info.sequence)));
@@ -778,7 +761,9 @@ impl Table<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::EVICTED;
     use std::collections::{BTreeMap, BTreeSet};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 
     use super::*;
     use crate::classify::{Category, Reclaim, classify, classify_where};
@@ -1062,7 +1047,7 @@ mod tests {
         };
         for attributes in [EVICTED, FILE_ATTRIBUTE_HIDDEN] {
             let mut away = dir(1, root, "cloud");
-            away.info.attributes = attributes;
+            away.info.set_attributes(attributes);
             let before: Volume = [
                 (20, away),
                 (21, file(1, &[(20, 1, "held")], 100)),

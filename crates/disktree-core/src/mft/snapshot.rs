@@ -472,8 +472,8 @@ fn fresh(lists: &Lists) -> FxHashMap<u32, Fresh> {
             if let Some(apparent) = apparent {
                 info.apparent = apparent;
             }
-            if info.reparse_tag == 0 {
-                info.reparse_tag = tag;
+            if !info.has_tag() {
+                info.set_tag(tag);
             }
         }
     }

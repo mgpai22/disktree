@@ -32,9 +32,10 @@ use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_NO_BUFFERING, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_NO_BUFFERING, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
 };
 
 use crate::scan::{ScanOptions, ScanProgress};
@@ -104,15 +105,53 @@ const EVICTED: u32 =
 struct Info {
     in_use: bool,
     directory: bool,
+    hidden: bool,
+    evicted: bool,
+    reparse: u8,
     /// Bumped each time the record is reused: a reference carrying another
     /// one names a file that is gone.
     sequence: u16,
-    attributes: u32,
-    reparse_tag: u32,
     modified: i64,
     apparent: u64,
     allocated: u64,
     names: u8,
+}
+
+impl Info {
+    const REPARSE: u8 = 1;
+    const TAGGED: u8 = 2;
+    const SURROGATE: u8 = 4;
+
+    const fn set_attributes(&mut self, attributes: u32) {
+        self.hidden = attributes & FILE_ATTRIBUTE_HIDDEN != 0;
+        self.evicted = attributes & EVICTED != 0;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            self.reparse |= Self::REPARSE;
+        } else {
+            self.reparse &= !Self::REPARSE;
+        }
+    }
+
+    const fn has_tag(&self) -> bool {
+        self.reparse & Self::TAGGED != 0
+    }
+
+    const fn is_link(&self) -> bool {
+        self.reparse & (Self::REPARSE | Self::SURROGATE)
+            == (Self::REPARSE | Self::SURROGATE)
+    }
+
+    /// Presence must survive even for non-surrogate tags: otherwise a
+    /// stale name hint or extension could turn a directory into a link.
+    const fn set_tag(&mut self, tag: u32) {
+        self.reparse &= !(Self::TAGGED | Self::SURROGATE);
+        if tag != 0 {
+            self.reparse |= Self::TAGGED;
+        }
+        if tag & NAME_SURROGATE != 0 {
+            self.reparse |= Self::SURROGATE;
+        }
+    }
 }
 
 /// Empty stretches of the MFT need no record storage. A page lookup
@@ -937,6 +976,7 @@ fn parse_fixed(
     };
     let mut apparent = None;
     let mut allocated = 0_u64;
+    let mut tag = 0;
     // A reparse point's tag is also kept beside each name, which serves
     // when the `$REPARSE_POINT` value is not in the record itself.
     let mut name_tag = 0;
@@ -947,7 +987,7 @@ fn parse_fixed(
                     info.modified = u64_at(value, 0x08).map_or(0, |ticks| {
                         crate::windows::unix_seconds(ticks.cast_signed())
                     });
-                    info.attributes = u32_at(value, 0x20).unwrap_or(0);
+                    info.set_attributes(u32_at(value, 0x20).unwrap_or(0));
                 }
             }
             FILE_NAME => {
@@ -994,15 +1034,16 @@ fn parse_fixed(
             }
             REPARSE_POINT => {
                 if let Some(value) = attribute.value() {
-                    info.reparse_tag = u32_at(value, 0).unwrap_or(0);
+                    tag = u32_at(value, 0).unwrap_or(0);
                 }
             }
             _ => {}
         }
     }
-    if info.reparse_tag == 0 {
-        info.reparse_tag = name_tag;
+    if tag == 0 {
+        tag = name_tag;
     }
+    info.set_tag(tag);
     if base & REFERENCE == 0 {
         if !info.directory {
             out.files += 1;
@@ -1012,14 +1053,9 @@ fn parse_fixed(
         info.apparent = apparent.unwrap_or(0);
         info.allocated = allocated;
         *slot = info;
-    } else if apparent.is_some() || allocated != 0 || info.reparse_tag != 0 {
-        out.extra.push((
-            owner,
-            base_sequence,
-            apparent,
-            allocated,
-            info.reparse_tag,
-        ));
+    } else if apparent.is_some() || allocated != 0 || tag != 0 {
+        out.extra
+            .push((owner, base_sequence, apparent, allocated, tag));
     }
 }
 
@@ -1211,8 +1247,8 @@ fn merge(
         if let Some(apparent) = apparent {
             info.apparent = apparent;
         }
-        if info.reparse_tag == 0 {
-            info.reparse_tag = tag;
+        if !info.has_tag() {
+            info.set_tag(tag);
         }
     }
     (names, texts)
@@ -1426,7 +1462,7 @@ mod tests {
 
         assert!(info.in_use);
         assert!(!info.directory);
-        assert_eq!(info.attributes, FILE_ATTRIBUTE_HIDDEN);
+        assert!(info.hidden);
         assert_eq!((info.apparent, info.allocated), (5000, 8192));
         // The 8.3 alias is the same entry again, not a second name.
         let [entry] = &out.names[..] else {
@@ -1439,6 +1475,52 @@ mod tests {
             "report for the board.txt"
         );
         assert_eq!(out.files, 1);
+    }
+
+    #[test]
+    fn reparse_tag_precedence_preserves_directory_and_link_kinds() {
+        const ORDINARY: u32 = 0x8000_0017;
+        const SURROGATE: u32 = 0xA000_0003;
+        for (reparse_attribute, tag, hint, extra, kind) in [
+            (true, ORDINARY, SURROGATE, 0, NodeKind::Directory),
+            (true, 0, SURROGATE, 0, NodeKind::Symlink),
+            (true, ORDINARY, 0, SURROGATE, NodeKind::Directory),
+            (true, 0, 0, SURROGATE, NodeKind::Symlink),
+            (false, SURROGATE, 0, 0, NodeKind::Directory),
+        ] {
+            let mut named = name(ROOT, "target", 1);
+            let at = usize::from(u16_at(&named, 0x14).expect("value offset"));
+            named[at + 0x38..at + 0x3C]
+                .copy_from_slice(&FILE_ATTRIBUTE_REPARSE_POINT.to_le_bytes());
+            named[at + 0x3C..at + 0x40].copy_from_slice(&hint.to_le_bytes());
+            let mut base = record(
+                IN_USE | IS_DIRECTORY,
+                0,
+                &[
+                    standard(if reparse_attribute {
+                        FILE_ATTRIBUTE_REPARSE_POINT
+                    } else {
+                        0
+                    }),
+                    named,
+                    resident(REPARSE_POINT, &tag.to_le_bytes()),
+                ],
+            );
+            base[0x10..0x12].copy_from_slice(&1_u16.to_le_bytes());
+            let extension = record(
+                IN_USE,
+                32 | (1 << 48),
+                &[resident(REPARSE_POINT, &extra.to_le_bytes())],
+            );
+            let state = read_all(&[(32, base), (33, extension)]);
+            let info = *state.infos.get(32).expect("base record");
+            let options = ScanOptions::default();
+            let progress = ScanProgress::default();
+            let table =
+                table(&[(32, ROOT, 5, "target", info)], &options, &progress);
+            let tree = tree_of(&table).ok().expect("tree");
+            assert_eq!(tree.children[0].kind, kind);
+        }
     }
 
     #[test]
@@ -1859,6 +1941,7 @@ mod tests {
             ..Info::default()
         };
         let dir = Info {
+            in_use: true,
             directory: true,
             sequence: 3,
             ..file
@@ -1872,7 +1955,7 @@ mod tests {
                 5,
                 "hidden.txt",
                 Info {
-                    attributes: FILE_ATTRIBUTE_HIDDEN,
+                    hidden: true,
                     ..file
                 },
             ),
@@ -1882,7 +1965,7 @@ mod tests {
                 5,
                 "evicted",
                 Info {
-                    attributes: FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+                    evicted: true,
                     ..dir
                 },
             ),
@@ -1893,8 +1976,7 @@ mod tests {
                 5,
                 "link",
                 Info {
-                    attributes: FILE_ATTRIBUTE_REPARSE_POINT,
-                    reparse_tag: 0xA000_0003,
+                    reparse: Info::REPARSE | Info::TAGGED | Info::SURROGATE,
                     ..dir
                 },
             ),
