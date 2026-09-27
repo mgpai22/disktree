@@ -252,19 +252,29 @@ pub(super) fn resume(
     file: &Path,
     options: &ScanOptions,
 ) -> Option<(Flat, Option<Checkpoint>)> {
-    let (mut flat, checkpoint) = load(file, geometry, journal, key(options))?;
-    let checkpoint = &checkpoint;
-    let (files, next) = changes(volume, journal, checkpoint.next)?;
-    let mut numbers: Vec<u32> = files.keys().copied().collect();
-    numbers.extend(&checkpoint.revisit);
-    numbers.sort_unstable();
-    numbers.dedup();
-    numbers.extend(moved(volume, &checkpoint.big, &numbers, options));
-    numbers.sort_unstable();
-    if numbers.len() > MOST_CHANGES {
-        return None;
-    }
-    let lists = read_again(path, geometry, &numbers)?;
+    let kept = open(file, geometry, journal, key(options))?;
+    let checkpoint = &kept.checkpoint;
+    // The tree comes off its file while the journal is read and the files
+    // it names are read again from NTFS. Those wait on the file system, on
+    // threads of their own: on the scan's, they kept the tree waiting.
+    let (flat, journaled) = std::thread::scope(|scope| {
+        let journaled = scope.spawn(|| {
+            let (files, next) = changes(volume, journal, checkpoint.next)?;
+            let mut numbers: Vec<u32> = files.keys().copied().collect();
+            numbers.extend(&checkpoint.revisit);
+            numbers.sort_unstable();
+            numbers.dedup();
+            numbers.extend(moved(volume, &checkpoint.big, &numbers, options));
+            numbers.sort_unstable();
+            if numbers.len() > MOST_CHANGES {
+                return None;
+            }
+            let lists = read_again(path, geometry, &numbers)?;
+            Some((files, next, numbers, lists))
+        });
+        (body(file, &kept), journaled.join().ok().flatten())
+    });
+    let (mut flat, (files, next, numbers, lists)) = (flat?, journaled?);
     let fresh = fresh(&lists);
     let created =
         |number| files.get(&number).is_some_and(|change| change.created);
@@ -860,6 +870,7 @@ fn write_region<T: Sync>(
 
 /// The tree kept in `file`, if it is of this volume and these options and
 /// `journal` still reaches back to where it left off.
+#[cfg(test)]
 fn load(
     file: &Path,
     geometry: &Geometry,
