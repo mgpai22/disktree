@@ -320,6 +320,9 @@ impl Seen {
 /// Levels whose subtrees are aggregated in parallel. A top level already
 /// splits a disk into enough work for every thread; below it a parallel
 /// frame per level would only cut the depth that fits in a worker's stack.
+/// Handing out every folder of 32 entries or more, at any depth, built the
+/// tree of a 4.2 million file `C:\` in 216 ms against 385 ms, but the
+/// elevated scan then spent 0.9 s more CPU for 0.35 s less wall time.
 pub(crate) const PARALLEL_LEVELS: usize = 4;
 
 fn aggregate_at(

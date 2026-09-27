@@ -32,7 +32,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::scan::{ScanOptions, ScanProgress};
-use crate::tree::{Node, NodeKind};
+use crate::tree::{Node, NodeKind, Seen, settle_directory, settle_leaf};
 use crate::windows::{Aligned, drive_letter};
 
 /// Most bytes read per call: large enough that the disk streams, small
@@ -210,6 +210,7 @@ pub fn scan(
         starts,
         options,
         progress,
+        seen: options.dedup_hardlinks.then(Seen::new),
     };
     let tree = table.directory(ROOT, crate::scan::file_name(root), 0);
     // Hundreds of megabytes, whose freeing the caller would otherwise
@@ -1031,6 +1032,9 @@ struct Table<'a> {
     starts: Vec<u32>,
     options: &'a ScanOptions,
     progress: &'a ScanProgress,
+    /// Files charged already, when hardlinks count once: totals are
+    /// settled as the tree is built, rather than in a pass over it after.
+    seen: Option<Seen>,
 }
 
 impl Table<'_> {
@@ -1095,6 +1099,7 @@ impl Table<'_> {
         };
         let mut node = Node::directory(name);
         node.children = children;
+        settle_directory(&mut node, self.options.metric);
         Ok(node)
     }
 
@@ -1147,6 +1152,7 @@ impl Table<'_> {
         if info.names > 1 {
             node.inode = Some((0, u64::from(entry.child)));
         }
+        settle_leaf(&mut node, self.seen.as_ref());
         Ok(Some(node))
     }
 }
@@ -1564,6 +1570,7 @@ mod tests {
             starts,
             options,
             progress,
+            seen: options.dedup_hardlinks.then(Seen::new),
         }
     }
 

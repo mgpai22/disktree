@@ -784,7 +784,11 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             if progress.is_cancelled() {
                 return Err(crate::mft::cancelled());
             }
-            let node = finish_tree(node, &context.options);
+            // The reader settles every total as it builds the tree; what is
+            // left is naming what the space is. On the walk's pool: see
+            // `finish_tree`.
+            let mut node = node;
+            WALK_POOL.install(|| crate::classify::classify(&mut node));
             // The reader counted every file on the volume; the tree may
             // hold fewer.
             progress.settle(node.files, node.dirs, node.bytes);
