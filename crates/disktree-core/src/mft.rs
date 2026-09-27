@@ -33,7 +33,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::scan::{ScanOptions, ScanProgress};
-use crate::tree::{Node, PARALLEL_LEVELS, Seen, settle_directory};
+use crate::tree::{Node, Seen};
 use crate::windows::{Aligned, drive_letter};
 
 mod flat;
@@ -215,10 +215,9 @@ pub fn scan(
         progress,
         seen: options.dedup_hardlinks.then(Seen::new),
     };
-    let tree = table.nodes().map(|mut node| {
-        node.name = crate::scan::file_name(root);
-        node
-    });
+    let tree = table
+        .build()
+        .and_then(|flat| flat.tree(crate::scan::file_name(root), progress));
     // Hundreds of megabytes, whose freeing the caller would otherwise
     // wait out before it can finish the tree.
     let Table {
@@ -1021,8 +1020,8 @@ fn merge(parsed: Vec<Parsed>, infos: &mut [Info]) -> (Vec<Entry>, Vec<String>) {
     (names, texts)
 }
 
-/// Why [`Table::directory`] gave up: the scan was cancelled, or the tree
-/// runs deeper than [`MOST_LEVELS`].
+/// Why a tree was not made: the scan was cancelled, or the tree runs
+/// deeper than [`MOST_LEVELS`].
 struct Stop;
 
 struct Table<'a> {
@@ -1055,64 +1054,6 @@ impl Table<'_> {
             }
             _ => &[],
         }
-    }
-
-    /// The tree beneath the root as nodes, totalled and ordered but not
-    /// classified. What each entry becomes is `flat`'s.
-    fn nodes(&self) -> Result<Node, Stop> {
-        let sequence = self
-            .infos
-            .get(ROOT as usize)
-            .map_or(0, |info| info.sequence);
-        self.directory(ROOT, sequence, Box::default(), 0)
-    }
-
-    fn directory(
-        &self,
-        number: u32,
-        sequence: u16,
-        name: Box<str>,
-        depth: usize,
-    ) -> Result<Node, Stop> {
-        if depth >= MOST_LEVELS || self.progress.is_cancelled() {
-            return Err(Stop);
-        }
-        let descend = self.descend(depth);
-        let child = |entry: &Entry| {
-            Some(match self.entry(entry, sequence, descend).transpose()? {
-                Err(stop) => Err(stop),
-                Ok(flat::Built::File(item)) => {
-                    Ok(flat::leaf(&item, self.name(entry)))
-                }
-                Ok(flat::Built::Directory(child, child_sequence)) => self
-                    .directory(
-                        child,
-                        child_sequence,
-                        self.name(entry).into(),
-                        depth + 1,
-                    ),
-            })
-        };
-        let entries = self.entries(number);
-        // See `tree::PARALLEL_LEVELS`: parallel only near the top.
-        let children = if depth < PARALLEL_LEVELS {
-            entries
-                .par_iter()
-                .filter_map(child)
-                .collect::<Result<_, _>>()?
-        } else {
-            // Sized up front: nearly every entry becomes a child, and a
-            // list grown by doubling copies its nodes over and over.
-            let mut children = Vec::with_capacity(entries.len());
-            for node in entries.iter().filter_map(child) {
-                children.push(node?);
-            }
-            children
-        };
-        let mut node = Node::directory(name);
-        node.children = children;
-        settle_directory(&mut node, self.options.metric);
-        Ok(node)
     }
 }
 
@@ -1155,7 +1096,7 @@ mod tests {
 
     /// The tree a table makes, the way a scan makes it.
     fn tree_of(table: &Table<'_>) -> Result<Node, Stop> {
-        let mut node = table.nodes()?;
+        let mut node = table.build()?.tree("C:".into(), table.progress)?;
         crate::classify::classify(&mut node);
         Ok(node)
     }
