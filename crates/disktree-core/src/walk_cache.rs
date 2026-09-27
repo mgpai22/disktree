@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Ioctl::{
 
 use super::{Classified, ScanOptions, WalkContext, push_named};
 use crate::tree::{
-    Dir, FILE, IDENTIFIED, Item, Metric, READ_ERROR, Seg, Tree, name_in,
+    Dir, FILE, IDENTIFIED, Item, Metric, NONE, READ_ERROR, Seg, Tree, name_in,
     seconds,
 };
 use crate::windows;
@@ -638,8 +638,9 @@ impl Update<'_> {
                                     made.flags = IDENTIFIED;
                                 }
                                 tree.dirs.push(made);
-                                // New trees share cancellation, policy and limits
-                                // with this refresh, rather than start another scan.
+                                // New trees share cancellation, policy and
+                                // limits with this refresh, rather than
+                                // start another scan.
                                 self.relist(tree, child, &path, depth + 1)?;
                                 child
                             };
@@ -690,7 +691,7 @@ impl Update<'_> {
         }
         // Removing the charged name must refresh every remaining alias.
         for &removed in old.values() {
-            self.touch_removed(tree, removed)?;
+            self.drop_removed(tree, removed)?;
         }
         Some(())
     }
@@ -713,13 +714,16 @@ impl Update<'_> {
             .map(|entry| entry.path(parent))
     }
 
-    fn touch_removed(&mut self, tree: &Tree, index: u32) -> Option<()> {
+    /// Drop directory `index`, gone from its parent, and all beneath it,
+    /// as [`Dir::parent`] says a dropped one is, touching every file it
+    /// held.
+    fn drop_removed(&mut self, tree: &mut Tree, index: u32) -> Option<()> {
         let mut stack = vec![index];
         while let Some(index) = stack.pop() {
-            let Some(dir) = tree.dirs.get(index as usize) else {
+            let Some(&dir) = tree.dirs.get(index as usize) else {
                 continue;
             };
-            for item in tree.run(dir) {
+            for item in tree.run(&dir) {
                 if item.is_dir() {
                     stack.push(item.value as u32);
                 } else if item.identified() {
@@ -729,6 +733,11 @@ impl Update<'_> {
                     }
                 }
             }
+            tree.dirs[index as usize] = Dir {
+                parent: NONE,
+                len: 0,
+                ..dir
+            };
         }
         Some(())
     }
