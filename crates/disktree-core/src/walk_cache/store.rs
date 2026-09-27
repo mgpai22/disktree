@@ -480,6 +480,11 @@ impl<R: Read> Stream<R> {
             None
         };
         let len = usize::try_from(self.varint()?).ok()?;
+        // An entry keeps its name's length in 16 bits; only the root's is
+        // the tree's own. No file system names a file that long.
+        if depth > 0 && len > usize::from(u16::MAX) {
+            return None;
+        }
         let name = std::str::from_utf8(self.take(len)?).ok()?;
         if !name_fits(name, depth) {
             return None;
@@ -930,5 +935,37 @@ mod tests {
             let tree = Tree::from_draft(dir("r", vec![file]), Metric::Bytes);
             assert_eq!(encoded(&state(tree)).is_ok(), kept, "{volume}");
         }
+    }
+
+    #[test]
+    fn a_name_longer_than_an_entry_holds_is_not_loaded() {
+        // Written by hand: no tree has such a name to save. A root "r" on
+        // `C:/`, holding one file whose name is 64 KiB of `a`.
+        let long = 1 << 16;
+        let mut bytes = Vec::new();
+        let mut out = Sealed::new(&mut bytes);
+        out.write(&MAGIC).unwrap();
+        // The checksum's place, then the header: volume, root id, journal,
+        // next, created, options, open files, the root's length, nodes,
+        // directories and name bytes.
+        for value in [0, 1, 5, 1, 1, 1, 0, 0, 3, 2, 1, long] {
+            out.u64(value).unwrap();
+        }
+        out.write(b"C:/").unwrap();
+        // The root: modified, bytes, files, dirs, entries, then its name.
+        out.write(&[DIRECTORY, 0]).unwrap();
+        for value in [0, 1, 1, 1, 1, 1] {
+            out.varint(value).unwrap();
+        }
+        out.write(b"r").unwrap();
+        // The file: modified, size, then its name.
+        out.write(&[crate::tree::FILE]).unwrap();
+        for value in [0, 1, long] {
+            out.varint(value).unwrap();
+        }
+        out.write(&vec![b'a'; long as usize]).unwrap();
+        let sum = out.finish().unwrap();
+        bytes[8..16].copy_from_slice(&sum.to_le_bytes());
+        assert!(decoded(&bytes).is_none());
     }
 }
