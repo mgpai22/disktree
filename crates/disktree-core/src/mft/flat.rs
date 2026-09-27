@@ -198,6 +198,30 @@ fn decode((category, reclaim): Kind) -> (Category, Option<Reclaim>) {
     (category, reclaim)
 }
 
+/// Entries, all levels down, past which a directory's entries are shared
+/// out across threads. By size rather than by depth: a disk's weight sits
+/// unevenly, one user's folder four levels down holding half of it, and
+/// below this a task costs more than it saves.
+const SPLIT: u64 = 1 << 15;
+
+/// The threads that turn a kept tree into nodes. Making millions of nodes
+/// is mostly asking the heap for memory and faulting it in, which threads
+/// do at once only by waiting on each other: on a 4.9 million entry
+/// `C:\` it took 626 ms on 1 thread, 354 ms on 4, 141-225 ms on 8 and
+/// 192-223 ms on 16, where 16 spent 1.2-1.6 s of CPU and 8 half that.
+static NODES: std::sync::LazyLock<rayon::ThreadPool> =
+    std::sync::LazyLock::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads().clamp(1, 8))
+            .thread_name(|index| format!("disktree-nodes-{index}"))
+            .build()
+            .expect("a thread pool")
+    });
+
+const fn is_big(dir: &Dir) -> bool {
+    dir.files.saturating_add(dir.dirs) > SPLIT
+}
+
 /// Largest first, then by name: `tree::settle_directory`'s order.
 fn order(
     (left_key, left_name): (u64, &[u8]),
@@ -291,7 +315,7 @@ impl Flat {
         progress: &ScanProgress,
     ) -> Result<Node, Stop> {
         let stopped = AtomicBool::new(false);
-        let root = self.node(0, name, 0, progress, &stopped);
+        let root = NODES.install(|| self.node(0, name, 0, progress, &stopped));
         if stopped.load(Ordering::Relaxed) || progress.is_cancelled() {
             return Err(Stop);
         }
@@ -365,8 +389,14 @@ impl Flat {
             }
         };
         let run = self.run(dir);
-        node.children.reserve_exact(run.len());
-        node.children.extend(run.iter().map(child));
+        if is_big(&dir) {
+            run.par_iter()
+                .map(child)
+                .collect_into_vec(&mut node.children);
+        } else {
+            node.children.reserve_exact(run.len());
+            node.children.extend(run.iter().map(child));
+        }
         for child in node.children.iter().filter(|child| !child.is_dir()) {
             node.own_bytes = node.own_bytes.saturating_add(child.bytes);
             node.own_files = node.own_files.saturating_add(child.files);
@@ -476,8 +506,16 @@ impl Flat {
                 out,
             );
         };
-        for item in run {
-            child(item, out);
+        if is_big(&dir) {
+            out.par_extend(run.par_iter().flat_map_iter(|item| {
+                let mut kinds = Vec::new();
+                child(item, &mut kinds);
+                kinds
+            }));
+        } else {
+            for item in run {
+                child(item, out);
+            }
         }
     }
 
