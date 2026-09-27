@@ -210,12 +210,19 @@ pub fn scan(
                 (Some(file), Some(checkpoint))
                     if tree.is_ok() && !progress.is_cancelled() =>
                 {
+                    // What patches left behind is not worth keeping.
                     snapshot::save_later(
                         file,
                         &geometry,
                         options,
                         checkpoint,
-                        move || Some(flat),
+                        move || {
+                            Some(if flat.has_garbage() {
+                                flat.compact()
+                            } else {
+                                flat
+                            })
+                        },
                     );
                 }
                 // A few large lists, freed at once.

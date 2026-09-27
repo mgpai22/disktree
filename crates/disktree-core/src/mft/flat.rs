@@ -822,8 +822,65 @@ impl Flat {
         });
     }
 
-    /// `(record, sequence, size)` of the `count` largest files among the
-    /// tree's entries.
+    /// Whether a patch left entries, names or directories behind that the
+    /// tree no longer shows.
+    pub(super) fn has_garbage(&self) -> bool {
+        let shown: u64 = self
+            .dirs
+            .iter()
+            .filter(|dir| dir.is_live())
+            .map(|dir| u64::from(dir.len))
+            .sum();
+        shown != self.items.len() as u64
+            || self.dirs.iter().any(|dir| !dir.is_live())
+    }
+
+    /// The tree without what patches left behind, its directories in the
+    /// order a walk from the root meets them.
+    pub(super) fn compact(&self) -> Self {
+        let mut out = Self {
+            dirs: Vec::with_capacity(self.dirs.len()),
+            items: Vec::with_capacity(self.items.len()),
+            text: Vec::with_capacity(self.text.len()),
+        };
+        let Some(&root) = self.dirs.first() else {
+            return out;
+        };
+        out.dirs.push(root);
+        // Where each directory of `out` was.
+        let mut from = vec![0_u64];
+        let mut at = 0;
+        while let Some(dir) = from.get(at).and_then(|&old| self.dir(old)) {
+            let first = out.items.len() as u32;
+            for item in self.run(dir) {
+                let mut item = *item;
+                let name = name_of(&self.text, &item);
+                item.at = out.text.len() as u32;
+                out.text.extend_from_slice(name);
+                if item.kind == DIRECTORY {
+                    let Some(child) = self.dir(item.value) else {
+                        continue;
+                    };
+                    from.push(item.value);
+                    item.value = out.dirs.len() as u64;
+                    out.dirs.push(Dir {
+                        parent: at as u32,
+                        ..child
+                    });
+                }
+                out.items.push(item);
+            }
+            let dir = &mut out.dirs[at];
+            dir.first = first;
+            dir.len = out.items.len() as u32 - first;
+            at += 1;
+        }
+        out
+    }
+
+    /// `(record, sequence, size)` of the `count` largest files the tree
+    /// shows, which must hold nothing it does not show: see
+    /// [`Flat::compact`].
     pub(super) fn largest(&self, count: usize) -> Vec<(u32, u16, u64)> {
         let mut files: Vec<(u64, u32, u16)> = self
             .items
@@ -1352,7 +1409,11 @@ mod tests {
             patch(&mut flat, &before, &after, &options).expect("patched");
             let expected = built(&after, &options);
             assert_eq!(lines(&flat), lines(&expected));
-            assert!(flat.is_valid());
+            // And again from what a save keeps.
+            assert_eq!(lines(&flat.compact()), lines(&expected));
+            assert!(flat.has_garbage());
+            assert!(!flat.compact().has_garbage());
+            assert!(flat.compact().is_valid());
         }
         let tree = |flat: &Flat| {
             flat.tree("C:".into(), &ScanProgress::default())
@@ -1626,7 +1687,11 @@ mod tests {
                     lines(&built(&volume, &options)),
                     "round {round}"
                 );
-                assert!(flat.is_valid());
+                // A save now and then, as a resumed scan makes.
+                if round % 7 == 0 {
+                    flat = flat.compact();
+                    assert!(flat.is_valid());
+                }
             }
         }
     }
