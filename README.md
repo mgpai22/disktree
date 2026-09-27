@@ -316,6 +316,18 @@ The same program, with Windows' answers to the questions above:
   `-l`, whose links the table does not follow. disktree flushes the volume
   after its own removals so the rescan shows them; changes other programs
   made seconds before may not show yet.
+  The finished tree that read made is kept in `%LOCALAPPDATA%\disktree`
+  (about 280 MB for that drive), and the next launch or rescan starts from
+  it: NTFS's change journal names every file changed since, only those are
+  read again, from NTFS itself rather than the disk, and only the folders
+  holding them, and those above, are totalled, ordered and classified
+  again. On the same drive a launch took about 0.4 s and half the CPU of
+  the previous release's 0.9 s. The whole table is read again when the
+  journal no longer reaches back that far (it holds a few hours of a busy
+  disk), when more than 100,000 files changed, when the scan options
+  differ from the kept tree's, when a folder whose contents the tree never
+  held comes into view (a cloud folder made local), or a day after the
+  last whole read.
   Started without admin rights, disktree walks as before. On a whole NTFS
   drive without `-l`, or once Windows refuses the walk a folder, the side
   panel offers **Restart as Administrator**, which reopens the same folder

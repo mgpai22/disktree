@@ -73,7 +73,11 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 2. **`own_bytes`/`own_files` are derived, never tracked.** `tree::aggregate`
    computes the totals from the children. Hardlink de-duplication zeroes a
    duplicate leaf's weight while that pass runs; anything that patches
-   `bytes` directly will be overwritten.
+   `bytes` directly will be overwritten. The file table reader builds its
+   tree already settled and classified, from a flat tree (`mft/flat.rs`)
+   with the same totals, order and kinds; a resumed scan changes that flat
+   tree and totals, orders and classifies again only what a change
+   reaches. Tests there hold it to a tree built whole.
 3. **A directory is only built when its own scan *and* every subdirectory task
    has finished.** That is the `+1` sentinel in `PendingDir::pending`. Building
    early silently drops whole subtrees — it has happened once.
@@ -108,6 +112,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | free space and projections | `crates/disktree-core/src/space.rs` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
+| starting that read from the last one and the change journal | `crates/disktree-core/src/mft/snapshot.rs` |
+| the kept tree: built, changed in place, turned into nodes | `crates/disktree-core/src/mft/flat.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
