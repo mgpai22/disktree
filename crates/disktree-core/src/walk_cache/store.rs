@@ -63,7 +63,7 @@ pub(super) struct State {
 
 /// The state kept in `path`, if it is whole and of this format.
 pub(super) fn load(path: &Path) -> Option<State> {
-    let mut file = File::open(path).ok()?;
+    let mut file = crate::windows::cache_read(path)?;
     let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
     if len > MOST_BYTES {
         return None;

@@ -912,7 +912,7 @@ fn open(
     journal: Journal,
     key: u64,
 ) -> Option<Kept> {
-    let mut input = File::open(file).ok()?;
+    let mut input = crate::windows::cache_read(file)?;
     let mut header = [0_u8; HEADER];
     input.read_exact(&mut header).ok()?;
     if header[..8] != MAGIC {

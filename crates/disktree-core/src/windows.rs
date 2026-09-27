@@ -24,12 +24,18 @@ use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Component, Path, PathBuf, Prefix};
 
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
     ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE, MAX_PATH,
+    OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
@@ -40,6 +46,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
     GetVolumePathNamesForVolumeNameW, OpenFileById, ReOpenFile, SYNCHRONIZE,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use crate::space::SpaceInfo;
 
@@ -1005,6 +1012,92 @@ fn standard_sizes(file: &File) -> io::Result<(u64, u64)> {
     ))
 }
 
+/// The directory `dir`, open: what is in it is then opened through this
+/// handle, and nothing above it is looked up again.
+fn cache_directory(dir: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+}
+
+/// Open, or as `disposition` says make, the file `name` in the open
+/// `directory`, through its handle: nothing above it is looked up again. A
+/// link named `name` is opened itself, not followed.
+fn open_in(
+    directory: &File,
+    name: &OsStr,
+    access: u32,
+    share: u32,
+    disposition: u32,
+) -> io::Result<File> {
+    let name: Vec<u16> = name.encode_wide().collect();
+    let length = u16::try_from(name.len() * 2).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "cache name too long")
+    })?;
+    let object = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: name.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: directory.as_raw_handle(),
+        ObjectName: &raw const object,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: `attributes` and all it points at (the name, the directory's
+    // open handle) are live for the call;
+    // the outputs are live locals; no extended attributes are passed.
+    let result = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            access | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            share,
+            disposition,
+            FILE_NON_DIRECTORY_FILE
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(nt_error(result));
+    }
+    // SAFETY: a handle just made and owned by nothing else; `File` closes
+    // it.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// The cache at `path`, open for reading; `None` sends the scan back to a
+/// whole read. Opened through its directory's handle, and a link in its
+/// place is not followed.
+pub fn cache_read(path: &Path) -> Option<File> {
+    let directory = cache_directory(path.parent()?).ok()?;
+    let file = open_in(
+        &directory,
+        path.file_name()?,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+    )
+    .ok()?;
+    let attributes = winapi_util::file::information(&file)
+        .ok()?
+        .file_attributes();
+    (attributes & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) == 0).then_some(file)
+}
+
 /// Another handle on the file `original` has open, for reads at offsets of
 /// their own: one synchronous handle serializes its reads. Made from the
 /// handle, not the path, so it is the file already checked.
@@ -1024,6 +1117,12 @@ pub fn cache_reopen(original: &File) -> io::Result<File> {
     }
     // SAFETY: ReOpenFile returned a new handle owned by this File alone.
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+fn nt_error(status: i32) -> io::Error {
+    // SAFETY: only translates a status code.
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    io::Error::from_raw_os_error(code.cast_signed())
 }
 
 /// Bytes aligned to a page, for reads that bypass the file cache: those
