@@ -286,7 +286,11 @@ impl Tree {
             )
             .collect();
         for index in gone {
-            self.drop_beneath(index, &removed);
+            // A file charged to a name that went, whose other names stay,
+            // is not read again: only a whole read charges one of those.
+            if self.drop_beneath(index, &removed) && options.dedup_hardlinks {
+                return None;
+            }
         }
 
         // Each changed directory's entries again, as a run of their own in
@@ -381,7 +385,14 @@ impl Tree {
 
     /// Drop directory `index` and everything beneath it that stayed
     /// there: an entry in `removed` has another place now, or none.
-    fn drop_beneath(&mut self, index: u32, removed: &FxHashSet<(u32, u32)>) {
+    /// Whether that dropped a file with more names by the one it is
+    /// charged to, which leaves the others weighing nothing.
+    fn drop_beneath(
+        &mut self,
+        index: u32,
+        removed: &FxHashSet<(u32, u32)>,
+    ) -> bool {
+        let mut charged = false;
         let mut stack = vec![index];
         while let Some(index) = stack.pop() {
             let Some(dir) = self.dirs.get_mut(index as usize) else {
@@ -401,15 +412,22 @@ impl Tree {
                 continue;
             };
             for at in first..first.saturating_add(len) {
-                if let Some(item) = from.items.get(at as usize)
-                    && item.is_dir()
-                    && !removed.contains(&(seg, at))
-                    && let Ok(child) = u32::try_from(item.value)
-                {
-                    stack.push(child);
+                let Some(item) = from.items.get(at as usize) else {
+                    continue;
+                };
+                if removed.contains(&(seg, at)) {
+                    continue;
+                }
+                if item.is_dir() {
+                    if let Ok(child) = u32::try_from(item.value) {
+                        stack.push(child);
+                    }
+                } else if item.identified() && item.value > 0 {
+                    charged = true;
                 }
             }
         }
+        charged
     }
 
     /// Whether a patch left entries, names or directories behind that the
@@ -1071,6 +1089,37 @@ mod tests {
         patch(&mut tree, &before, &after, &options).expect("patched");
         let root = tree.root();
         assert_eq!((root.bytes(), root.files()), (16384 + 4096, 4));
+    }
+
+    #[test]
+    fn a_hardlink_charged_name_leaving_the_view_needs_a_whole_read() {
+        let root = (ROOT, 5);
+        let before: Volume = [
+            (20, dir(1, root, "a")),
+            (21, dir(1, root, "b")),
+            (30, file(1, &[(20, 1, "x"), (21, 1, "x")], 8192)),
+        ]
+        .into_iter()
+        .collect();
+        for (dedup, patched) in [(true, false), (false, true)] {
+            let options = ScanOptions {
+                include_hidden: false,
+                dedup_hardlinks: dedup,
+                ..ScanOptions::default()
+            };
+            let mut tree = built(&before, &options);
+            // The folder of whichever name the build charged is hidden now;
+            // `x` in the other still weighs nothing.
+            let a = tree.root().child_named("a").expect("a");
+            let (number, name) =
+                if a.bytes() > 0 { (20, "a") } else { (21, "b") };
+            let mut hidden = dir(1, root, name);
+            hidden.info.set_attributes(FILE_ATTRIBUTE_HIDDEN);
+            let mut after = before.clone();
+            after.insert(number, hidden);
+            let outcome = patch(&mut tree, &before, &after, &options);
+            assert_eq!(outcome.is_some(), patched, "dedup {dedup}");
+        }
     }
 
     #[test]
