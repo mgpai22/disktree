@@ -201,11 +201,24 @@ pub fn scan(
     let resumed = file.as_deref().zip(journal).and_then(|(file, journal)| {
         snapshot::resume(&path, &volume, &geometry, journal, file, options)
     });
-    if let Some(flat) = resumed {
-        return finished(
-            flat.tree(crate::scan::file_name(root), progress),
-            progress,
-        );
+    if let Some((flat, checkpoint)) = resumed {
+        let tree = flat.tree(crate::scan::file_name(root), progress);
+        match (file, checkpoint) {
+            (Some(file), Some(checkpoint))
+                if tree.is_ok() && !progress.is_cancelled() =>
+            {
+                snapshot::save_later(
+                    file,
+                    &geometry,
+                    options,
+                    checkpoint,
+                    move || Some(flat),
+                );
+            }
+            // A few large lists, freed at once.
+            _ => drop(flat),
+        }
+        return finished(tree, progress);
     }
     let (mut state, checkpoint) =
         read_whole(&path, &volume, &geometry, journal, options, progress)?;

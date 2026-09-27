@@ -1,16 +1,16 @@
-//! Keeping a scan's finished tree for the next one: the flat tree a whole
-//! read made, written to a file in the scan's cache directory, with where
-//! the volume's change journal stood when the read began. The next scan
-//! starts from it: the journal names every file changed since, and only
-//! those records are read again, from NTFS itself rather than the disk,
-//! so they are as current as the file system is; `flat.rs` takes them
-//! into the tree.
+//! Starting a scan from the last one: the tree it finished, kept on disk,
+//! brought up to date from the volume's change journal, the way
+//! `Everything` stays current. The journal names every file changed since,
+//! and only those records are read again, from NTFS itself rather than the
+//! disk, so they are as current as the file system is; `flat.rs` takes
+//! them into the tree.
 //!
 //! Anything that does not line up gives up and reads the whole table: no
-//! journal, another journal (it was deleted and made again), a kept tree
-//! of another format, volume, record size or scan options, or one that
-//! fails its checksum or is not a tree, a journal that has since dropped
-//! the changes wanted, or changes the kept tree cannot take in.
+//! journal, another journal (it was deleted and made again), a journal
+//! that has since dropped the changes wanted (it keeps a few hours of a
+//! busy disk), a kept tree of another format, volume, record size or scan
+//! options, one that fails its checksum or is not a tree, more changes
+//! than a whole read would cost, or changes the kept tree cannot take in.
 //!
 //! Three kinds of change the journal alone would miss are handled apart. A
 //! file still open for writing grows with no new journal entry until it is
@@ -51,11 +51,20 @@ use crate::windows::{control, sizes_by_id};
 /// older build is read again rather than trusted.
 const MAGIC: [u8; 8] = *b"dttree\x00\x02";
 
+/// Changed files past which reading them one by one costs more than
+/// reading the whole table: 64,000 took 1 s from NTFS with their records
+/// in memory, and three times that without.
+const MOST_CHANGES: usize = 100_000;
+
 /// How long before a whole read a change may still be only in memory: its
 /// file is read again from NTFS on the next scan. Of 64,000 files the
 /// journal named on a busy `C:\`, the disk and NTFS disagreed on 5 changed
 /// in the last 5 s, one 48 s old, and none older.
 const LAG_TICKS: i64 = 2 * 60 * 10_000_000;
+
+/// How old the last whole read may be before a scan reads the table whole
+/// again rather than resume: a bound on what the journal cannot show.
+const MOST_AGE_TICKS: i64 = 24 * 60 * 60 * 10_000_000;
 
 /// Files looked at again on every scan, largest first. One held open and
 /// growing for hours (a virtual machine's disk, a log) adds no journal
@@ -67,6 +76,14 @@ const LAG_TICKS: i64 = 2 * 60 * 10_000_000;
 /// waiting on the extension records and attribute lists of big, broken-up
 /// files.
 const BIG_FILES: usize = 1024;
+
+/// Journal since the snapshot, in bytes, and files read again, past which
+/// a resumed scan writes its state down again. Below both, the next scan
+/// replays from the same older snapshot: writing one is 350 MB and more
+/// CPU than the rest of a resumed scan, while replaying an hour of a busy
+/// `C:\` (about 8 MiB of journal) again costs little.
+const RESAVE_JOURNAL: u64 = 8 << 20;
+const RESAVE_FILES: usize = 20_000;
 
 /// Bytes of the journal read per call.
 const JOURNAL_BUFFER: usize = 1 << 20;
@@ -85,6 +102,8 @@ pub(super) struct Journal {
 pub(super) struct Checkpoint {
     journal: u64,
     next: u64,
+    /// When the table was last read whole, as a `FILETIME`.
+    whole: i64,
     /// Files last seen open for writing: read again until closed.
     open: Vec<u32>,
     /// `open`, and after a whole read the files changed just before it.
@@ -214,6 +233,7 @@ pub(super) fn after_whole_read(
     let checkpoint = Checkpoint {
         journal: journal.id,
         next: journal.next,
+        whole: started,
         open,
         revisit,
         big: Vec::new(),
@@ -222,7 +242,8 @@ pub(super) fn after_whole_read(
 }
 
 /// The last scan's tree brought up to date; `None` when a whole read is
-/// needed instead.
+/// needed instead. With it, where the next scan picks up, when that is
+/// worth writing down: see [`RESAVE_JOURNAL`].
 pub(super) fn resume(
     path: &str,
     volume: &File,
@@ -230,21 +251,54 @@ pub(super) fn resume(
     journal: Journal,
     file: &Path,
     options: &ScanOptions,
-) -> Option<Flat> {
+) -> Option<(Flat, Option<Checkpoint>)> {
     let (mut flat, checkpoint) = load(file, geometry, journal, key(options))?;
-    let (files, _) = changes(volume, journal, checkpoint.next)?;
+    let checkpoint = &checkpoint;
+    let (files, next) = changes(volume, journal, checkpoint.next)?;
     let mut numbers: Vec<u32> = files.keys().copied().collect();
     numbers.extend(&checkpoint.revisit);
     numbers.sort_unstable();
     numbers.dedup();
     numbers.extend(moved(volume, &checkpoint.big, &numbers, options));
     numbers.sort_unstable();
-    let fresh = fresh(&read_again(path, geometry, &numbers)?);
+    if numbers.len() > MOST_CHANGES {
+        return None;
+    }
+    let lists = read_again(path, geometry, &numbers)?;
+    let fresh = fresh(&lists);
     let created =
         |number| files.get(&number).is_some_and(|change| change.created);
     let touched = flat.patch(&numbers, &fresh, created, options)?;
     flat.classify(&touched);
-    Some(flat)
+    if next.saturating_sub(checkpoint.next) < RESAVE_JOURNAL
+        && numbers.len() < RESAVE_FILES
+    {
+        return Some((flat, None));
+    }
+    let mut open: Vec<u32> = checkpoint
+        .open
+        .iter()
+        .copied()
+        .filter(|number| !files.contains_key(number))
+        .collect();
+    open.extend(
+        files
+            .iter()
+            .filter(|(_, change)| !change.closed)
+            .map(|(&number, _)| number),
+    );
+    open.sort_unstable();
+    Some((
+        flat,
+        Some(Checkpoint {
+            journal: journal.id,
+            next,
+            whole: checkpoint.whole,
+            revisit: open.clone(),
+            open,
+            big: Vec::new(),
+        }),
+    ))
 }
 
 /// Those of `big`, the largest files, whose size is not the one kept, or
@@ -567,10 +621,10 @@ fn key(options: &ScanOptions) -> u64 {
         | u64::from(options.metric == Metric::Files) << 3
 }
 
-/// Header: magic, serial, record size, journal, next, the options, and
-/// the counts of directories, entries, name bytes, open, revisit and big
-/// files, then the checksum of all that follows.
-const HEADER: usize = 8 * 13;
+/// Header: magic, serial, record size, journal, next, when last read
+/// whole, the options, and the counts of directories, entries, name bytes,
+/// open, revisit and big files, then the checksum of all that follows.
+const HEADER: usize = 8 * 14;
 const DIR: usize = 52;
 const ITEM: usize = 30;
 const NUMBER: usize = 4;
@@ -721,6 +775,7 @@ fn save(
         record as u64,
         checkpoint.journal,
         checkpoint.next,
+        checkpoint.whole.cast_unsigned(),
         key,
         tree.dirs.len() as u64,
         tree.items.len() as u64,
@@ -804,16 +859,21 @@ fn open(
     let count = |index: usize| usize::try_from(value(index)?).ok();
     if value(0)? != geometry.serial
         || value(1)? != geometry.record as u64
-        || value(4)? != key
+        || value(5)? != key
     {
         return None;
     }
     let next = value(3)?;
-    if value(2)? != journal.id || next < journal.first || next > journal.next {
+    let whole = value(4)?.cast_signed();
+    if value(2)? != journal.id
+        || next < journal.first
+        || next > journal.next
+        || now_ticks().saturating_sub(whole) > MOST_AGE_TICKS
+    {
         return None;
     }
-    let (dirs, items, text) = (count(5)?, count(6)?, count(7)?);
-    let (open, revisit, big) = (count(8)?, count(9)?, count(10)?);
+    let (dirs, items, text) = (count(6)?, count(7)?, count(8)?);
+    let (open, revisit, big) = (count(9)?, count(10)?, count(11)?);
     // Sizes checked against the file before anything is allocated for
     // them: a corrupt count must not ask for terabytes.
     let numbers = open.checked_add(revisit)?;
@@ -844,11 +904,12 @@ fn open(
         dirs,
         items,
         text,
-        sum: value(11)?,
+        sum: value(12)?,
         numbers: sum ^ big_sum,
         checkpoint: Checkpoint {
             journal: journal.id,
             next,
+            whole,
             open: open.to_vec(),
             revisit: revisit.to_vec(),
             big,
@@ -1024,6 +1085,7 @@ mod tests {
         let checkpoint = Checkpoint {
             journal: 0xABCD,
             next: 123_456,
+            whole: now_ticks(),
             open: vec![30],
             revisit: vec![31],
             big: Vec::new(),
@@ -1077,6 +1139,18 @@ mod tests {
         assert!(load(&file, &geometry(7), wrapped, key).is_none());
         let remade = Journal { id: 1, ..JOURNAL };
         assert!(load(&file, &geometry(7), remade, key).is_none());
+        // Nor one whose table was last read whole two days ago.
+        let old = Checkpoint {
+            journal: checkpoint.journal,
+            next: checkpoint.next,
+            whole: now_ticks() - 2 * MOST_AGE_TICKS,
+            open: Vec::new(),
+            revisit: Vec::new(),
+            big: Vec::new(),
+        };
+        save(&file, 7, 1024, key, &saved, &old).expect("saved");
+        assert!(load(&file, &geometry(7), JOURNAL, key).is_none());
+        save(&file, 7, 1024, key, &saved, &checkpoint).expect("saved");
 
         // A damaged byte fails the checksum; a short file its length.
         let bytes = std::fs::read(&file).expect("read");
