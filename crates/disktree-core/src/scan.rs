@@ -415,6 +415,7 @@ impl WalkContext {
         Classified::Subdirectory {
             path,
             name: entry.take_name(),
+            inode: entry.identity(),
         }
     }
 
@@ -464,6 +465,7 @@ impl WalkContext {
             return Classified::Subdirectory {
                 path: path.to_path_buf(),
                 name,
+                inode: identity_of(path, &meta),
             };
         }
 
@@ -494,6 +496,10 @@ impl WalkContext {
 /// would cost an open per file; [`crate::windows`] lists a directory with
 /// both instead.
 trait Listed {
+    fn identity(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// The entry's path inside `dir`, the directory it was listed from.
     fn entry_path(&self, dir: &Path) -> PathBuf;
     /// Non-UTF-8 names are lossy for display. The scan still measures them
@@ -609,6 +615,10 @@ impl Listed for Named {
 
 #[cfg(windows)]
 impl Listed for crate::windows::Entry {
+    fn identity(&self) -> Option<(u64, u64)> {
+        self.identity()
+    }
+
     fn entry_path(&self, dir: &Path) -> PathBuf {
         self.path(dir)
     }
@@ -687,7 +697,11 @@ fn list(
 /// What a directory entry turned out to be.
 enum Classified {
     /// Descend into this directory on a new task.
-    Subdirectory { path: PathBuf, name: Box<str> },
+    Subdirectory {
+        path: PathBuf,
+        name: Box<str>,
+        inode: Option<(u64, u64)>,
+    },
     /// A leaf that contributes size.
     Entry(Node),
     /// Intentionally left out by the scan policy.
@@ -700,6 +714,7 @@ enum Classified {
 #[derive(Debug)]
 struct PendingDir {
     path: PathBuf,
+    inode: Option<(u64, u64)>,
     parent: Option<Arc<Self>>,
     /// Starts at 1 for the directory itself; one more per subdirectory task.
     /// When it reaches zero the directory is complete.
@@ -725,9 +740,11 @@ impl PendingDir {
         name: Box<str>,
         parent: Option<Arc<Self>>,
         depth: usize,
+        inode: Option<(u64, u64)>,
     ) -> Self {
         Self {
             path,
+            inode,
             parent,
             pending: AtomicUsize::new(1),
             partial: Mutex::new(Partial {
@@ -755,7 +772,7 @@ impl PendingDir {
             files: 0,
             own_files: 0,
             dirs: 1,
-            inode: None,
+            inode: self.inode,
             read_error: self.read_error.load(Ordering::Relaxed),
             modified: 0,
             category: crate::classify::Category::Other,
@@ -837,6 +854,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
         file_name(root),
         None,
         0,
+        identity_of(root, &root_meta),
     ));
     let context: &WalkContext = context;
     WALK_POOL.install(|| rayon::scope(|scope| walk(scope, &root_dir, context)));
@@ -924,13 +942,14 @@ fn walk<'scope>(
                 match entry {
                     Ok(mut entry) => {
                         match context.classify(&dir.path, &mut entry) {
-                            Classified::Subdirectory { path, name } => {
+                            Classified::Subdirectory { path, name, inode } => {
                                 tally.dirs += 1;
                                 subdirs.push(Arc::new(PendingDir::new(
                                     path,
                                     name,
                                     Some(Arc::clone(dir)),
                                     dir.depth + 1,
+                                    inode,
                                 )));
                             }
                             Classified::Entry(node) => {

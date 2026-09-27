@@ -74,7 +74,8 @@ pub struct Node {
     pub own_files: u64,
     /// Directories at or beneath this node; `1` for a directory.
     pub dirs: u64,
-    /// `(device, inode)` for files, used to de-duplicate hardlinks.
+    /// `(device, inode)` for hardlink accounting. Windows walks also keep
+    /// directory identities so journal changes find their cached parents.
     pub inode: Option<(u64, u64)>,
     /// The directory could not be read; its contents are unknown.
     pub read_error: bool,
