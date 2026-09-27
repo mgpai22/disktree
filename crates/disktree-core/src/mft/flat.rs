@@ -933,7 +933,10 @@ fn sort(run: &mut [(u64, Item)], text: &[u8]) {
 }
 
 impl Table<'_> {
-    /// The tree beneath the root, totalled and ordered.
+    /// The tree beneath the root, finished but for kinds. On one thread:
+    /// a scan builds its nodes from the table first (see `Table::nodes`)
+    /// and this tree after, on the thread that keeps it, where time
+    /// matters less than work.
     pub(super) fn build(&self) -> Result<Flat, Stop> {
         let sequence = self
             .infos
@@ -1080,6 +1083,19 @@ impl Table<'_> {
     }
 }
 
+/// A file's or link's node, settled.
+pub(super) fn leaf(item: &Item, name: &str) -> Node {
+    let kind = if item.kind == LINK {
+        NodeKind::Symlink
+    } else {
+        NodeKind::File
+    };
+    let mut node = Node::entry(name, kind, item.value);
+    node.modified = item.modified;
+    node.inode = item.shared.then_some((0, u64::from(item.record)));
+    node
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1165,7 +1181,8 @@ mod tests {
         }
     }
 
-    /// The tree a whole read of `volume` makes.
+    /// The tree a whole read of `volume` makes; checks on the way that the
+    /// nodes the build makes with it are the tree's.
     fn built(volume: &Volume, options: &ScanOptions) -> Flat {
         let progress = ScanProgress::default();
         let table = table(volume, options, &progress);
@@ -1174,6 +1191,24 @@ mod tests {
         };
         flat.classify(&[]);
         assert!(flat.is_valid());
+        // The nodes a scan hands over are built apart, the same way, with
+        // hardlinks charged afresh.
+        let Ok(mut node) = self::table(volume, options, &progress).nodes()
+        else {
+            panic!("the table makes nodes");
+        };
+        node.name = "C:".into();
+        crate::classify::classify(&mut node);
+        let mut made = Vec::new();
+        describe(&node, "", &mut made);
+        let shown = lines(&flat);
+        // Which name of a hardlinked file weighs is whichever each build
+        // meets first; the totals are the same.
+        if options.dedup_hardlinks {
+            assert_eq!(made[0], shown[0], "the nodes built apart");
+        } else {
+            assert_eq!(made, shown, "the nodes built apart");
+        }
         flat
     }
 

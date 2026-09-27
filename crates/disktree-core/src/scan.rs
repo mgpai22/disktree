@@ -805,8 +805,9 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             if progress.is_cancelled() {
                 return Err(crate::mft::cancelled());
             }
-            // The reader finishes the tree, kinds too. It counted every
-            // file on the volume; the tree may hold fewer.
+            // The reader finishes the tree, kinds too: kept between scans,
+            // they are decided again only where a change can reach. It
+            // counted every file on the volume; the tree may hold fewer.
             progress.settle(node.files, node.dirs, node.bytes);
             return Ok(node);
         }
