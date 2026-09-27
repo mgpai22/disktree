@@ -12,11 +12,13 @@
 //! fails its checksum or is not a tree, a journal that has since dropped
 //! the changes wanted, or changes the kept tree cannot take in.
 //!
-//! Two kinds of change the journal alone would miss are handled apart. A
+//! Three kinds of change the journal alone would miss are handled apart. A
 //! file still open for writing grows with no new journal entry until it is
 //! closed, so a file whose last entry is not a close is read again on
-//! every scan until one is. And the disk lags NTFS by the records it has
-//! not yet written back: after a whole read, the directories changed in the
+//! every scan until one is. One opened before the journal's oldest entry
+//! is not known to be open at all, so the largest files are looked at on
+//! every scan. And the disk lags NTFS by the records it has not yet
+//! written back: after a whole read, the directories changed in the
 //! minutes before it are read again at once, so their entries find them,
 //! and the files on the next scan.
 
@@ -43,7 +45,7 @@ use super::{
 };
 use crate::scan::ScanOptions;
 use crate::tree::Metric;
-use crate::windows::control;
+use crate::windows::{control, sizes_by_id};
 
 /// Bumped whenever what a kept tree holds changes, so one kept by an
 /// older build is read again rather than trusted.
@@ -54,6 +56,17 @@ const MAGIC: [u8; 8] = *b"dttree\x00\x02";
 /// journal named on a busy `C:\`, the disk and NTFS disagreed on 5 changed
 /// in the last 5 s, one 48 s old, and none older.
 const LAG_TICKS: i64 = 2 * 60 * 10_000_000;
+
+/// Files looked at again on every scan, largest first. One held open and
+/// growing for hours (a virtual machine's disk, a log) adds no journal
+/// entry until it is closed, and one opened before the journal's oldest
+/// entry is not known to be open at all: a WSL disk image grew 1 GB in an
+/// hour with none. Each is opened by its number for its sizes, which NTFS
+/// has current, and only one whose sizes moved is read again: reading all
+/// their records took 264-277 ms of every resumed scan, most of it
+/// waiting on the extension records and attribute lists of big, broken-up
+/// files.
+const BIG_FILES: usize = 1024;
 
 /// Bytes of the journal read per call.
 const JOURNAL_BUFFER: usize = 1 << 20;
@@ -76,6 +89,9 @@ pub(super) struct Checkpoint {
     open: Vec<u32>,
     /// `open`, and after a whole read the files changed just before it.
     revisit: Vec<u32>,
+    /// The largest files, `(record, sequence, size shown)`: read again
+    /// when their sizes moved.
+    big: Vec<(u32, u16, u64)>,
 }
 
 /// What one read of the table found, as `merge` leaves it.
@@ -200,6 +216,7 @@ pub(super) fn after_whole_read(
         next: journal.next,
         open,
         revisit,
+        big: Vec::new(),
     };
     Some((checkpoint, directories))
 }
@@ -220,12 +237,41 @@ pub(super) fn resume(
     numbers.extend(&checkpoint.revisit);
     numbers.sort_unstable();
     numbers.dedup();
+    numbers.extend(moved(volume, &checkpoint.big, &numbers, options));
+    numbers.sort_unstable();
     let fresh = fresh(&read_again(path, geometry, &numbers)?);
     let created =
         |number| files.get(&number).is_some_and(|change| change.created);
     let touched = flat.patch(&numbers, &fresh, created, options)?;
     flat.classify(&touched);
     Some(flat)
+}
+
+/// Those of `big`, the largest files, whose size is not the one kept, or
+/// cannot be asked for; `numbers`, sorted, are read again anyway.
+fn moved(
+    volume: &File,
+    big: &[(u32, u16, u64)],
+    numbers: &[u32],
+    options: &ScanOptions,
+) -> Vec<u32> {
+    big.par_iter()
+        .filter(|(number, ..)| numbers.binary_search(number).is_err())
+        .filter(|&&(number, sequence, shown)| {
+            let reference = u64::from(number) | u64::from(sequence) << 48;
+            sizes_by_id(volume, reference).ok().is_none_or(
+                |(length, allocated)| {
+                    shown
+                        != if options.apparent_size {
+                            length
+                        } else {
+                            allocated
+                        }
+                },
+            )
+        })
+        .map(|&(number, ..)| number)
+        .collect()
 }
 
 /// What re-reading `numbers` found: per list, the base records' facts and
@@ -522,12 +568,13 @@ fn key(options: &ScanOptions) -> u64 {
 }
 
 /// Header: magic, serial, record size, journal, next, the options, and
-/// the counts of directories, entries, name bytes, open and revisit files,
-/// then the checksum of all that follows.
-const HEADER: usize = 8 * 12;
+/// the counts of directories, entries, name bytes, open, revisit and big
+/// files, then the checksum of all that follows.
+const HEADER: usize = 8 * 13;
 const DIR: usize = 52;
 const ITEM: usize = 30;
 const NUMBER: usize = 4;
+const BIG: usize = 16;
 
 /// Bytes per write, and per stretch of the checksum. Two writes of a
 /// hundred megabytes and more took a table 427 ms to write; in pieces of a
@@ -539,6 +586,21 @@ const DIRS: u64 = 1;
 const ITEMS: u64 = 2;
 const TEXT: u64 = 3;
 const NUMBERS: u64 = 4;
+const BIGS: u64 = 5;
+
+fn encode_big(&(record, sequence, size): &(u32, u16, u64), out: &mut [u8]) {
+    out[0..4].copy_from_slice(&record.to_le_bytes());
+    out[4..6].copy_from_slice(&sequence.to_le_bytes());
+    out[8..16].copy_from_slice(&size.to_le_bytes());
+}
+
+fn decode_big(bytes: &[u8]) -> (u32, u16, u64) {
+    (
+        u32_at(bytes, 0).unwrap_or(0),
+        u16_at(bytes, 4).unwrap_or(0),
+        u64_at(bytes, 8).unwrap_or(0),
+    )
+}
 
 fn encode_dir(dir: &Dir, out: &mut [u8]) {
     out[0..4].copy_from_slice(&dir.record.to_le_bytes());
@@ -603,6 +665,7 @@ fn save(
     tree: &Flat,
     checkpoint: &Checkpoint,
 ) -> io::Result<()> {
+    let big = tree.largest(BIG_FILES);
     let numbers: Vec<u32> = checkpoint
         .open
         .iter()
@@ -622,7 +685,8 @@ fn save(
         + tree.dirs.len() * DIR
         + tree.items.len() * ITEM
         + tree.text.len()
-        + numbers.len() * NUMBER;
+        + numbers.len() * NUMBER
+        + big.len() * BIG;
     out.set_len(length as u64)?;
     // The header goes in last, once the checksum is known.
     out.write_all(&[0; HEADER])?;
@@ -649,6 +713,7 @@ fn save(
         |number, out| out.copy_from_slice(&number.to_le_bytes()),
         &mut piece,
     )?;
+    sum ^= write_region(&mut out, &big, BIG, BIGS, encode_big, &mut piece)?;
     let mut header = Vec::with_capacity(HEADER);
     header.extend_from_slice(&MAGIC);
     for value in [
@@ -662,6 +727,7 @@ fn save(
         tree.text.len() as u64,
         checkpoint.open.len() as u64,
         checkpoint.revisit.len() as u64,
+        big.len() as u64,
         sum,
     ] {
         header.extend_from_slice(&value.to_le_bytes());
@@ -747,7 +813,7 @@ fn open(
         return None;
     }
     let (dirs, items, text) = (count(5)?, count(6)?, count(7)?);
-    let (open, revisit) = (count(8)?, count(9)?);
+    let (open, revisit, big) = (count(8)?, count(9)?, count(10)?);
     // Sizes checked against the file before anything is allocated for
     // them: a corrupt count must not ask for terabytes.
     let numbers = open.checked_add(revisit)?;
@@ -757,7 +823,8 @@ fn open(
         .checked_add(text)?;
     let length = HEADER
         .checked_add(body)?
-        .checked_add(numbers.checked_mul(NUMBER)?)?;
+        .checked_add(numbers.checked_mul(NUMBER)?)?
+        .checked_add(big.checked_mul(BIG)?)?;
     if length != usize::try_from(input.metadata().ok()?.len()).ok()?
         || [dirs, items, text]
             .iter()
@@ -765,27 +832,26 @@ fn open(
     {
         return None;
     }
-    let (numbers, sum) = read_region(
-        file,
-        HEADER + body,
-        numbers,
-        NUMBER,
-        NUMBERS,
-        0,
-        |bytes| u32_at(bytes, 0).unwrap_or(0),
-    )?;
+    let at = HEADER + body;
+    let (numbers, sum) =
+        read_region(file, at, numbers, NUMBER, NUMBERS, 0, |bytes| {
+            u32_at(bytes, 0).unwrap_or(0)
+        })?;
+    let at = at + numbers.len() * NUMBER;
+    let (big, big_sum) = read_region(file, at, big, BIG, BIGS, 0, decode_big)?;
     let (open, revisit) = numbers.split_at(open);
     Some(Kept {
         dirs,
         items,
         text,
-        sum: value(10)?,
-        numbers: sum,
+        sum: value(11)?,
+        numbers: sum ^ big_sum,
         checkpoint: Checkpoint {
             journal: journal.id,
             next,
             open: open.to_vec(),
             revisit: revisit.to_vec(),
+            big,
         },
     })
 }
@@ -960,6 +1026,7 @@ mod tests {
             next: 123_456,
             open: vec![30],
             revisit: vec![31],
+            big: Vec::new(),
         };
         let dir = tempfile::TempDir::new().expect("tempdir");
         let file = file(dir.path(), 'C');
@@ -975,8 +1042,15 @@ mod tests {
             (&saved.dirs, &saved.items, &saved.text)
         );
         assert_eq!(
-            (kept.journal, kept.next, kept.open, kept.revisit),
-            (0xABCD, 123_456, vec![30], vec![31])
+            (kept.journal, kept.next, kept.open, kept.revisit, kept.big),
+            // The largest files are looked at whatever the journal says.
+            (
+                0xABCD,
+                123_456,
+                vec![30],
+                vec![31],
+                vec![(30, 3, 8192), (31, 3, 4096)]
+            )
         );
 
         // Another volume's, a table of another record size, or a scan

@@ -21,7 +21,7 @@ use std::io;
 use std::mem::offset_of;
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::os::windows::io::AsRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Component, Path, PathBuf, Prefix};
 
 use windows_sys::Win32::Foundation::{
@@ -32,12 +32,13 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
     FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileIdExtdDirectoryInfo, FindFirstVolumeW, FindNextVolumeW,
-    FindVolumeClose, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW,
-    GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FileIdExtdDirectoryInfo, FileIdType, FileStandardInfo, FindFirstVolumeW,
+    FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
+    GetVolumePathNamesForVolumeNameW, OpenFileById, SYNCHRONIZE,
 };
 
 use crate::space::SpaceInfo;
@@ -897,6 +898,52 @@ pub fn control(
         return Err(io::Error::last_os_error());
     }
     Ok(returned as usize)
+}
+
+/// A file's length and the bytes allocated to its unnamed stream as NTFS
+/// has them now, the file found by its reference (record number and
+/// sequence number) on `volume`'s volume. Opened for its attributes only,
+/// which no sharing mode refuses, and by number, so no path is needed.
+pub fn sizes_by_id(volume: &File, reference: u64) -> io::Result<(u64, u64)> {
+    let descriptor = FILE_ID_DESCRIPTOR {
+        dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
+        Type: FileIdType,
+        Anonymous: FILE_ID_DESCRIPTOR_0 {
+            FileId: reference.cast_signed(),
+        },
+    };
+    // SAFETY: the descriptor is live for the call, and no security
+    // attributes are passed.
+    let handle = unsafe {
+        OpenFileById(
+            volume.as_raw_handle(),
+            &raw const descriptor,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a handle just opened and owned by nothing else; `File`
+    // closes it.
+    let file = unsafe { File::from_raw_handle(handle) };
+    let mut info = FILE_STANDARD_INFO::default();
+    // SAFETY: `info` is live and as large as the length passed.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((bytes_from(info.EndOfFile), bytes_from(info.AllocationSize)))
 }
 
 /// Bytes aligned to a page, for reads that bypass the file cache: those

@@ -822,6 +822,29 @@ impl Flat {
         });
     }
 
+    /// `(record, sequence, size)` of the `count` largest files among the
+    /// tree's entries.
+    pub(super) fn largest(&self, count: usize) -> Vec<(u32, u16, u64)> {
+        let mut files: Vec<(u64, u32, u16)> = self
+            .items
+            .par_iter()
+            .filter(|item| item.kind != DIRECTORY)
+            .map(|item| (item.value, item.record, item.sequence))
+            .collect();
+        if files.len() > count {
+            files.select_nth_unstable_by(count, |left, right| right.cmp(left));
+            files.truncate(count);
+        }
+        let mut largest: Vec<(u32, u16, u64)> = files
+            .into_iter()
+            .map(|(size, record, sequence)| (record, sequence, size))
+            .collect();
+        // A file with more names that each weigh is one file.
+        largest.sort_unstable();
+        largest.dedup_by_key(|&mut (record, ..)| record);
+        largest
+    }
+
     /// Whether this is a tree: every run and name in bounds, every
     /// directory named once, by an entry of the directory it says holds
     /// it, and the root by none. A kept tree is a file another program can
