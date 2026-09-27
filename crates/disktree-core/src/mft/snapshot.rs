@@ -655,8 +655,17 @@ pub(super) fn save_later(
     let record = geometry.record;
     let key = key(options);
     let spawned = std::thread::Builder::new().spawn(move || {
-        if let Some(tree) = make() {
-            let _ = save(&file, serial, record, key, &tree, &checkpoint);
+        let work = || {
+            if let Some(tree) = make() {
+                let _ = save(&file, serial, record, key, &tree, &checkpoint);
+            }
+        };
+        // On this thread alone: nobody waits on it, and the parallel steps
+        // in making and writing the tree only woke the whole global pool
+        // to spin, which cost a cold scan up to a second of CPU.
+        match rayon::ThreadPoolBuilder::new().num_threads(1).build() {
+            Ok(alone) => alone.install(work),
+            Err(_) => work(),
         }
     });
     if let Ok(handle) = spawned {
