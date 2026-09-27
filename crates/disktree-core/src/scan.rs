@@ -59,6 +59,10 @@ pub struct ScanOptions {
     pub dedup_hardlinks: bool,
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
+    /// A directory the scan may keep what it read in, so the next scan of
+    /// the same volume starts from it; `None` keeps nothing. Only a whole
+    /// NTFS drive read as an administrator uses it.
+    pub cache: Option<PathBuf>,
 }
 
 impl Default for ScanOptions {
@@ -71,6 +75,7 @@ impl Default for ScanOptions {
             max_depth: None,
             dedup_hardlinks: true,
             metric: Metric::Bytes,
+            cache: None,
         }
     }
 }
@@ -235,6 +240,22 @@ impl ScanHandle {
     pub fn cancel(&self) {
         self.progress.cancel();
     }
+}
+
+/// Wait until what the last scan keeps for the next one (see
+/// [`ScanOptions::cache`]) is written: it is written after the tree is
+/// handed over, and a process that exits first loses it.
+#[cfg_attr(
+    not(windows),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "empty where nothing is saved in the background, but one \
+                  signature on every platform"
+    )
+)]
+pub fn wait_for_cache() {
+    #[cfg(windows)]
+    crate::mft::wait_for_saved();
 }
 
 /// Walk `root` and return the aggregated tree. Blocking.

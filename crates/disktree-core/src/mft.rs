@@ -17,6 +17,9 @@
 //! from a refused open to a record layout it does not expect, returns
 //! `None` and the walk measures instead, so this is only ever a faster way
 //! to the same tree.
+//!
+//! With [`ScanOptions::cache`] set, the finished tree a whole read made is
+//! kept for the next scan: see `snapshot.rs`.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -37,6 +40,10 @@ use crate::tree::{Node, Seen};
 use crate::windows::{Aligned, drive_letter};
 
 mod flat;
+mod snapshot;
+
+use snapshot::Checkpoint;
+pub use snapshot::wait_for_saved;
 
 /// Most bytes read per call: large enough that the disk streams, small
 /// enough that many reads are outstanding at once.
@@ -159,6 +166,8 @@ struct Geometry {
     mft_offset: u64,
     /// The volume's size in bytes: no table can be larger.
     volume: u64,
+    /// The serial number the volume was formatted with.
+    serial: u64,
 }
 
 /// The tree under `root`, read from the volume's file table; `None` when
@@ -175,9 +184,25 @@ pub fn scan(
     if options.follow_links {
         return None;
     }
-    let path = format!(r"\\.\{}:", drive_letter(canonical)?);
+    let letter = drive_letter(canonical)?;
+    let path = format!(r"\\.\{letter}:");
+    // Its file must not change under the read of it next.
+    wait_for_saved();
     let volume = open_volume(&path).ok()?;
     let geometry = geometry(&volume)?;
+    // A depth limit leaves out directories a later change can bring into
+    // view, with entries a kept tree would not hold: nothing is kept.
+    let file = options
+        .cache
+        .as_deref()
+        .filter(|_| options.max_depth.is_none())
+        .map(|dir| snapshot::file(dir, letter));
+    // Where the journal stands before the read: the next scan picks up
+    // there.
+    let checkpoint = file
+        .as_ref()
+        .and_then(|_| snapshot::query(&volume))
+        .map(Checkpoint::before);
     let (runs, bitmap) = table_layout(&volume, &geometry)?;
     let reads = plan_reads(
         &runs,
@@ -218,7 +243,23 @@ pub fn scan(
     };
     let tree = table.build().and_then(|mut flat| {
         flat.classify();
-        flat.tree(crate::scan::file_name(root), progress)
+        let tree = flat.tree(crate::scan::file_name(root), progress);
+        match (file, checkpoint) {
+            (Some(file), Some(checkpoint))
+                if tree.is_ok() && !progress.is_cancelled() =>
+            {
+                snapshot::save_later(
+                    file,
+                    &geometry,
+                    options,
+                    checkpoint,
+                    move || Some(flat),
+                );
+            }
+            // A few large lists, freed at once.
+            _ => drop(flat),
+        }
+        tree
     });
     // Hundreds of megabytes, whose freeing the caller would otherwise
     // wait out before it can finish the tree.
@@ -316,6 +357,7 @@ fn geometry_of(boot: &[u8]) -> Option<Geometry> {
         record: usize::try_from(record).ok()?,
         mft_offset,
         volume,
+        serial: u64_at(boot, 0x48)?,
     })
 }
 
@@ -1297,6 +1339,7 @@ mod tests {
             record: RECORD,
             mft_offset: 0,
             volume: 1 << 30,
+            serial: 0,
         };
         let record = RECORD as u64;
         let gap = GAP_BYTES / record;

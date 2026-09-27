@@ -864,6 +864,41 @@ pub const fn unix_seconds(ticks: i64) -> i64 {
     }
 }
 
+/// Send control `code` to the device or file behind `handle`, with `input`,
+/// filling `output`: the bytes it wrote.
+pub fn control(
+    handle: &File,
+    code: u32,
+    input: &[u8],
+    output: &mut [u8],
+) -> io::Result<usize> {
+    let mut returned = 0_u32;
+    let (Ok(in_len), Ok(out_len)) =
+        (u32::try_from(input.len()), u32::try_from(output.len()))
+    else {
+        return Err(io::ErrorKind::InvalidInput.into());
+    };
+    // SAFETY: both buffers are live for the lengths passed, `input` is only
+    // read and `output` only written, and without an `OVERLAPPED` the call
+    // is done with them when it returns.
+    let ok = unsafe {
+        windows_sys::Win32::System::IO::DeviceIoControl(
+            handle.as_raw_handle(),
+            code,
+            input.as_ptr().cast(),
+            in_len,
+            output.as_mut_ptr().cast(),
+            out_len,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(returned as usize)
+}
+
 /// Bytes aligned to a page, for reads that bypass the file cache: those
 /// want memory aligned to the disk's sector, which a page always is.
 #[derive(Debug, Default)]
