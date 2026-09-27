@@ -568,27 +568,47 @@ impl Tree {
             })
     }
 
-    /// Whether every directory the root reaches is fewer than
+    /// Whether every directory in the tree hangs from the root fewer than
     /// [`MOST_LEVELS`] below it, as a whole read of the table builds them,
     /// so what walks a tree on a thread's stack is not too deep for it.
-    /// Only for a tree whose every directory is named once: a level at a
-    /// time from the root, each is then met once.
+    /// Up each directory's parents, keeping every level found, so each is
+    /// climbed once: a pass over the directories, not over every entry,
+    /// which took a warm launch 20 ms more.
     fn within_levels(&self) -> bool {
-        let mut level = vec![0_u64];
-        for _ in 0..MOST_LEVELS {
-            let next: Vec<u64> = level
-                .par_iter()
-                .filter_map(|&index| self.dir(index))
-                .flat_map_iter(|dir| self.run(dir))
-                .filter(|item| item.is_dir())
-                .map(|item| item.value)
-                .collect();
-            if next.is_empty() {
-                return true;
+        // 0 for a level not known yet; only the root's is 0.
+        let mut levels = vec![0_u16; self.dirs.len()];
+        let mut chain = Vec::new();
+        for (index, dir) in self.dirs.iter().enumerate().skip(1) {
+            if !is_live(dir) || levels[index] != 0 {
+                continue;
             }
-            level = next;
+            let mut at = index;
+            let mut level = loop {
+                // Deeper than allowed, or parents that loop.
+                if chain.len() >= MOST_LEVELS {
+                    return false;
+                }
+                chain.push(at);
+                let parent = self.dirs[at].parent as usize;
+                if parent == 0 {
+                    break 0;
+                }
+                match levels.get(parent) {
+                    Some(&0) => at = parent,
+                    Some(&known) => break known,
+                    // Hanging from nothing.
+                    None => return false,
+                }
+            };
+            while let Some(at) = chain.pop() {
+                level += 1;
+                if usize::from(level) >= MOST_LEVELS {
+                    return false;
+                }
+                levels[at] = level;
+            }
         }
-        false
+        true
     }
 }
 
