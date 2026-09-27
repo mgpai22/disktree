@@ -30,6 +30,10 @@ use rustc_hash::FxHashSet;
 
 use crate::tree::{Metric, Node, NodeKind, Seen, aggregate, aggregate_deduped};
 
+#[cfg(windows)]
+#[path = "walk_cache.rs"]
+mod walk_cache;
+
 /// Errors kept verbatim before the list is truncated; the count keeps rising.
 const MAX_ERROR_DETAIL: usize = 50;
 
@@ -60,8 +64,8 @@ pub struct ScanOptions {
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
     /// A directory the scan may keep what it read in, so the next scan of
-    /// the same volume starts from it; `None` keeps nothing. Only a whole
-    /// NTFS drive read as an administrator uses it.
+    /// the same volume starts from it; `None` keeps nothing. NTFS folder
+    /// walks use their own tree snapshot and the unprivileged journal.
     pub cache: Option<PathBuf>,
 }
 
@@ -242,9 +246,9 @@ impl ScanHandle {
     }
 }
 
-/// Wait until what the last scan keeps for the next one (see
-/// [`ScanOptions::cache`]) is written: it is written after the tree is
-/// handed over, and a process that exits first loses it.
+/// Wait for a background MFT snapshot write. The file-table reader can
+/// save after handing over the tree; folder walk snapshots finish before
+/// the scan returns. See [`ScanOptions::cache`].
 #[cfg_attr(
     not(windows),
     allow(
@@ -849,6 +853,8 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
         lock(&context.visited_dirs).insert(key);
     }
 
+    #[cfg(windows)]
+    let cache = walk_cache::Checkpoint::open(canonical, context);
     let root_dir = Arc::new(PendingDir::new(
         root.to_path_buf(),
         file_name(root),
@@ -863,7 +869,14 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     let node = node.ok_or_else(|| {
         io::Error::other(format!("{} produced no tree", root.display()))
     })?;
-    Ok(finish_tree(node, &context.options))
+    let node = finish_tree(node, &context.options);
+    #[cfg(windows)]
+    let node = if let Some(cache) = cache {
+        cache.save(node, context)
+    } else {
+        node
+    };
+    Ok(node)
 }
 
 /// The walk's workers, and the file table reader's. Listing directories

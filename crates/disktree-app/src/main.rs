@@ -264,8 +264,8 @@ fn parse_args(
     let metadata = std::fs::metadata(&root)
         .with_context(|| format!("cannot read {}", root.display()))?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());
-    // Where a scan of a whole drive read as an administrator keeps what it
-    // read, so the next launch or rescan reads only what changed since.
+    // Windows walks and MFT reads keep separate snapshots here, so the
+    // next launch can use the journal instead of measuring everything.
     options.cache = std::env::var_os("LOCALAPPDATA")
         .map(|dir| PathBuf::from(dir).join("disktree"));
 
