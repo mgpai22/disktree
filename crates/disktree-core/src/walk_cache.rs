@@ -5,6 +5,8 @@
 //! only those ancestor chains. Keeping the original checkpoint avoids a
 //! large cache rewrite on each launch.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash as _, Hasher as _};
 use std::os::windows::fs::OpenOptionsExt as _;
@@ -18,6 +20,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Ioctl::{
     FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_UNPRIVILEGED_USN_JOURNAL,
+    USN_REASON_CLOSE,
 };
 
 use super::{Classified, ScanOptions, WalkContext};
@@ -32,6 +35,10 @@ const MAX_CHANGES: usize = 100_000;
 const MAX_DIRECTORIES: usize = 10_000;
 const MAX_JOURNAL_BYTES: usize = 64 << 20;
 
+// ponytail: this bounds the blind spot without opening millions of files.
+// A writer predating the retained journal can still be missed when its
+// cached size is below this set; close or the 24-hour full walk repairs it.
+const LARGEST_FILES: usize = 1024;
 #[derive(Clone, Copy)]
 struct Journal {
     id: u64,
@@ -114,9 +121,27 @@ impl Checkpoint {
         }
         let loaded = started.elapsed();
         let changes = changes(&self.handle, self.journal, state.next)?;
+        let mut changed: FxHashSet<u64> =
+            changes.files.keys().copied().collect();
+        changed.extend(state.open.iter().copied());
+        let open = state
+            .open
+            .iter()
+            .copied()
+            .filter(|id| changes.files.get(id).is_none_or(|closed| !closed))
+            .chain(
+                changes
+                    .files
+                    .iter()
+                    .filter_map(|(&id, &closed)| (!closed).then_some(id)),
+            )
+            .collect();
+        if changed.len() > MAX_CHANGES {
+            return None;
+        }
         let mut update = Update {
             context,
-            changed: changes.files,
+            changed,
             parents: changes.parents,
             refreshed: FxHashSet::default(),
             touched: FxHashSet::default(),
@@ -147,7 +172,9 @@ impl Checkpoint {
         }
         let mut seen = FxHashSet::default();
         update.settle(&mut state.tree, &mut seen);
-        if !update.refreshed.is_empty() {
+        let (current, current_changed) =
+            update.refresh_current(&mut state.tree, &self.root, open)?;
+        if !update.refreshed.is_empty() || current_changed {
             // Classification can depend on sibling names and the dominant
             // top-level child. Reuse that policy rather than approximate it.
             crate::classify::classify(&mut state.tree);
@@ -161,11 +188,12 @@ impl Checkpoint {
         }
         if std::env::var_os("DISKTREE_WALK_TRACE").is_some() {
             eprintln!(
-                "walk-cache warm load_ms={} total_ms={} relisted={} refreshed_files={}",
+                "walk-cache warm load_ms={} total_ms={} relisted={} refreshed_files={} current_files={}",
                 loaded.as_millis(),
                 started.elapsed().as_millis(),
                 update.refreshed.len(),
                 update.touched.len(),
+                current,
             );
         }
         Some(state.tree)
@@ -184,6 +212,13 @@ impl Checkpoint {
             trace("cold unavailable: journal wrapped during walk");
             return tree;
         }
+        // Only the walk's starting cursor must remain covered; expiry of
+        // older history does not lose a change made during this walk. Seed
+        // known writers from the history retained now, not an expired start.
+        let Some(changes) = changes(&self.handle, after, after.first) else {
+            trace("cold unavailable: retained journal unreadable or too large");
+            return tree;
+        };
         let Some(root) = self.root.to_str() else {
             return tree;
         };
@@ -195,11 +230,20 @@ impl Checkpoint {
             next: self.journal.next,
             created: self.created,
             options: self.options,
-            open: Vec::new(),
+            open: changes
+                .files
+                .into_iter()
+                .filter_map(|(id, closed)| (!closed).then_some(id))
+                .collect(),
             tree,
         };
         let result = store::save(&self.file, &state);
-        trace(&format!("cold save={result:?}"));
+        if std::env::var_os("DISKTREE_WALK_TRACE").is_some() {
+            eprintln!(
+                "walk-cache cold save={result:?} open={}",
+                state.open.len()
+            );
+        }
         state.tree
     }
 }
@@ -238,7 +282,7 @@ fn query(handle: &File) -> Option<Journal> {
 }
 
 struct Changes {
-    files: FxHashSet<u64>,
+    files: FxHashMap<u64, bool>,
     parents: FxHashSet<u64>,
 }
 
@@ -247,7 +291,7 @@ fn changes(handle: &File, journal: Journal, from: u64) -> Option<Changes> {
         return None;
     }
     let mut changes = Changes {
-        files: FxHashSet::default(),
+        files: FxHashMap::default(),
         parents: FxHashSet::default(),
     };
     let mut buffer = vec![0; 1 << 20];
@@ -306,7 +350,8 @@ fn parse_changes(
         last = Some(usn);
         let id = number(record, 8)?;
         let parent = number(record, 16)?;
-        changes.files.insert(id);
+        let reason = u32::from_le_bytes(record.get(40..44)?.try_into().ok()?);
+        changes.files.insert(id, reason & USN_REASON_CLOSE != 0);
         changes.parents.insert(parent);
         if changes.files.len() > MAX_CHANGES
             || changes.parents.len() > MAX_CHANGES
@@ -349,6 +394,51 @@ fn cacheable(node: &Node, volume: u64, depth: usize) -> bool {
     node.children
         .iter()
         .all(|child| cacheable(child, volume, depth + 1))
+}
+
+struct CurrentFile {
+    bytes: u64,
+    modified: i64,
+    charged: bool,
+}
+
+fn largest_files(node: &Node, largest: &mut BinaryHeap<Reverse<(u64, u64)>>) {
+    if node.kind == NodeKind::File
+        && let Some((_, id)) = node.inode
+    {
+        let candidate = Reverse((node.bytes, id));
+        if largest.len() < LARGEST_FILES {
+            largest.push(candidate);
+        } else if let Some(mut smallest) = largest.peek_mut()
+            && candidate < *smallest
+        {
+            *smallest = candidate;
+        }
+    }
+    for child in &node.children {
+        largest_files(child, largest);
+    }
+}
+
+fn mark_current(
+    node: &Node,
+    current: &FxHashMap<u64, Option<CurrentFile>>,
+    chains: &mut FxHashSet<u64>,
+) -> Option<bool> {
+    if !node.is_dir() {
+        return Some(
+            node.kind == NodeKind::File
+                && node.inode.is_some_and(|(_, id)| current.contains_key(&id)),
+        );
+    }
+    let mut needed = false;
+    for child in &node.children {
+        needed |= mark_current(child, current, chains)?;
+    }
+    if needed {
+        chains.insert(node.inode?.1);
+    }
+    Some(needed)
 }
 
 struct Update<'a> {
@@ -519,6 +609,107 @@ impl Update<'_> {
         Some(())
     }
 
+    fn refresh_current(
+        &self,
+        tree: &mut Node,
+        root: &Path,
+        open: FxHashSet<u64>,
+    ) -> Option<(usize, bool)> {
+        let mut largest = BinaryHeap::with_capacity(LARGEST_FILES);
+        largest_files(tree, &mut largest);
+        let mut current: FxHashMap<u64, Option<CurrentFile>> = open
+            .into_iter()
+            .chain(largest.into_iter().map(|Reverse((_, id))| id))
+            .map(|id| (id, None))
+            .collect();
+        let mut chains = FxHashSet::default();
+        mark_current(tree, &current, &mut chains)?;
+        let changed =
+            self.measure_current(tree, root, &mut current, &chains)?;
+        Some((
+            current.values().filter(|value| value.is_some()).count(),
+            changed,
+        ))
+    }
+
+    fn measure_current(
+        &self,
+        node: &mut Node,
+        path: &Path,
+        current: &mut FxHashMap<u64, Option<CurrentFile>>,
+        chains: &FxHashSet<u64>,
+    ) -> Option<bool> {
+        if !chains.contains(&node.inode?.1) {
+            return Some(false);
+        }
+
+        let mut changed = false;
+        for child in &mut node.children {
+            if self.context.cancelled() {
+                return None;
+            }
+            if child.is_dir() {
+                if child.inode.is_some_and(|(_, id)| chains.contains(&id)) {
+                    let path = self.child_path(path, child)?;
+                    changed |=
+                        self.measure_current(child, &path, current, chains)?;
+                }
+            } else if child.kind == NodeKind::File
+                && let Some(key) = child.inode
+                && let Some(value) = current.get_mut(&key.1)
+            {
+                if value.is_none() {
+                    let native = self.child_path(path, child)?;
+                    let (bytes, modified) = windows::current_file(
+                        &native,
+                        key,
+                        self.context.options.apparent_size,
+                    )
+                    .or_else(|| {
+                        // A file may refuse opens while its parent still
+                        // reports the same facts a full walk would read.
+                        super::list(path, self.context.volume.get().copied())
+                            .ok()?
+                            .filter_map(Result::ok)
+                            .find(|entry| entry.identity() == Some(key))
+                            .map(|entry| {
+                                (
+                                    if self.context.options.apparent_size {
+                                        entry.apparent()
+                                    } else {
+                                        entry.allocated()
+                                    },
+                                    entry.modified(),
+                                )
+                            })
+                    })?;
+                    *value = Some(CurrentFile {
+                        bytes,
+                        modified,
+                        charged: false,
+                    });
+                }
+                let value = value.as_mut()?;
+                let bytes =
+                    if self.context.options.dedup_hardlinks && value.charged {
+                        0
+                    } else {
+                        value.bytes
+                    };
+                value.charged = true;
+                changed |= child.own_bytes != bytes
+                    || child.modified != value.modified;
+                child.own_bytes = bytes;
+                child.modified = value.modified;
+                settle_leaf(child, None);
+            }
+        }
+        if changed {
+            settle_directory(node, self.context.options.metric);
+        }
+        Some(changed)
+    }
+
     fn settle(&self, node: &mut Node, seen: &mut FxHashSet<u64>) -> bool {
         let mut dirty = node
             .inode
@@ -545,6 +736,26 @@ impl Update<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_refresh_selects_the_largest_files_without_directories() {
+        let mut root = Node::directory("root");
+        root.inode = Some((1, 9_999));
+        for size in 1..=2_048 {
+            let mut node = Node::entry(format!("{size}"), NodeKind::File, size);
+            node.inode = Some((1, size));
+            root.children.push(node);
+        }
+        crate::tree::aggregate(&mut root, Metric::Bytes);
+        let mut largest = BinaryHeap::new();
+        largest_files(&root, &mut largest);
+        let mut sizes: Vec<_> =
+            largest.into_iter().map(|Reverse((size, _))| size).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes.len(), 1_024);
+        assert_eq!(sizes.first(), Some(&1_025));
+        assert_eq!(sizes.last(), Some(&2_048));
+    }
 
     #[test]
     fn journal_coverage_refuses_gaps_replacement_and_old_snapshots() {
@@ -589,12 +800,13 @@ mod tests {
         record[8..16].copy_from_slice(&id.to_le_bytes());
         record[16..24].copy_from_slice(&13_u64.to_le_bytes());
         record[24..32].copy_from_slice(&100_u64.to_le_bytes());
+        record[40..44].copy_from_slice(&USN_REASON_CLOSE.to_le_bytes());
         let mut result = Changes {
-            files: FxHashSet::default(),
+            files: FxHashMap::default(),
             parents: FxHashSet::default(),
         };
         assert!(parse_changes(&record, 100, 164, &mut result).is_some());
-        assert!(result.files.contains(&id));
+        assert_eq!(result.files.get(&id), Some(&true));
         assert!(result.parents.contains(&13));
         assert!(parse_changes(&record, 101, 164, &mut result).is_none());
         assert!(parse_changes(&record, 100, 100, &mut result).is_none());

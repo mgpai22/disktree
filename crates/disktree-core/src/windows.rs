@@ -475,6 +475,60 @@ pub fn identity(path: &Path) -> Option<(u64, u64)> {
         .then(|| (info.volume_serial_number(), index))
 }
 
+/// Allocation (or length) and Unix write time from a known file's stream.
+/// Directory entries can retain different allocations for hardlink names.
+/// The identity must match; reparse points are not followed. The open asks
+/// only for attributes, shares read/write/delete, and reads no file data.
+pub fn current_file(
+    path: &Path,
+    expected: (u64, u64),
+    apparent: bool,
+) -> Option<(u64, i64)> {
+    const STANDARD: usize = size_of::<FILE_STANDARD_INFO>();
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    let info = winapi_util::file::information(&file).ok()?;
+    if (info.volume_serial_number(), info.file_index()) != expected
+        || info.file_attributes() & u64::from(FILE_ATTRIBUTE_DIRECTORY) != 0
+    {
+        return None;
+    }
+    // Read as words rather than as the struct: its flags are `bool`s, and
+    // a byte the kernel wrote need not be a valid one. The directory flag
+    // is not needed; the attributes above already said.
+    let mut standard = [0_u64; STANDARD.div_ceil(8)];
+    // SAFETY: the handle is open and owned by `file`; the pointer and
+    // length describe `standard`, writable for at least `STANDARD` bytes
+    // and 8-byte aligned as the struct needs, and not otherwise borrowed
+    // during the call.
+    let filled = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            standard.as_mut_ptr().cast(),
+            STANDARD as u32,
+        )
+    };
+    if filled == 0 {
+        return None;
+    }
+    let size_at = if apparent {
+        offset_of!(FILE_STANDARD_INFO, EndOfFile)
+    } else {
+        offset_of!(FILE_STANDARD_INFO, AllocationSize)
+    };
+    let bytes = bytes_from(standard[size_at / 8].cast_signed());
+    let modified = info
+        .last_write_time()
+        .and_then(|ticks| i64::try_from(ticks).ok())
+        .map_or(0, unix_seconds);
+    Some((bytes, modified))
+}
+
 /// Serial number of the volume every directory under `canonical` is on,
 /// for a walk that does not follow links. Only a local drive has one:
 /// mounted folders there are reparse points the walk takes for links,
