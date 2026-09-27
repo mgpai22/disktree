@@ -27,7 +27,9 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_OVERWRITE_IF, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, FileRenameInformationEx, NtCreateFile,
+    NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
@@ -35,16 +37,19 @@ use windows_sys::Win32::Foundation::{
     OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
     FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
     FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FileIdExtdDirectoryInfo, FileIdType, FileStandardInfo,
-    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+    FILE_STANDARD_INFO, FILE_WRITE_DATA, FileDispositionInfo,
+    FileIdExtdDirectoryInfo, FileIdType, FileStandardInfo, FindFirstVolumeW,
+    FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
     GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
     GetVolumePathNamesForVolumeNameW, OpenFileById, ReOpenFile, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1012,9 +1017,17 @@ fn standard_sizes(file: &File) -> io::Result<(u64, u64)> {
     ))
 }
 
-/// The directory `dir`, open: what is in it is then opened through this
-/// handle, and nothing above it is looked up again.
-fn cache_directory(dir: &Path) -> io::Result<File> {
+/// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `_POSIX_SEMANTICS`.
+const RENAME_REPLACE: u32 = 1;
+const RENAME_POSIX: u32 = 2;
+
+/// The directory `dir`, open, and for `create` made first: what is in it
+/// is then opened through this handle, and nothing above it is looked up
+/// again.
+fn cache_directory(dir: &Path, create: bool) -> io::Result<File> {
+    if create {
+        fs::create_dir_all(dir)?;
+    }
     OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -1083,7 +1096,7 @@ fn open_in(
 /// whole read. Opened through its directory's handle, and a link in its
 /// place is not followed.
 pub fn cache_read(path: &Path) -> Option<File> {
-    let directory = cache_directory(path.parent()?).ok()?;
+    let directory = cache_directory(path.parent()?, false).ok()?;
     let file = open_in(
         &directory,
         path.file_name()?,
@@ -1117,6 +1130,104 @@ pub fn cache_reopen(original: &File) -> io::Result<File> {
     }
     // SAFETY: ReOpenFile returned a new handle owned by this File alone.
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// Write the cache at `path` whole or not at all: `write` fills another
+/// file beside it, which then takes its name; on any failure that file is
+/// deleted and `path` keeps what it had. Both go through the directory's
+/// handle, not its path, so a link planted above it cannot send either
+/// elsewhere.
+pub fn cache_write(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a cache is a file in a directory",
+        ));
+    };
+    let directory = cache_directory(dir, true)?;
+    // One such name per cache: what a save cut short by a crash leaves is
+    // overwritten by the next, not left beside it for good, and sharing
+    // it with readers alone keeps a second save out while one writes.
+    let mut partial = name.to_os_string();
+    partial.push(".partial");
+    let mut file = open_in(
+        &directory,
+        &partial,
+        DELETE | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+        FILE_OVERWRITE_IF,
+    )?;
+    let written =
+        write(&mut file).and_then(|()| rename_in(&directory, &file, name));
+    if written.is_err() {
+        let gone = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the handle is open with DELETE access; `gone` is live for
+        // the call and as large as the length passed.
+        unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&raw const gone).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            );
+        }
+    }
+    written
+}
+
+/// Give the open `file` the name `name` in the open `directory`, over any
+/// file of that name there: NT looks the name up from the directory's
+/// handle, not from a path. (Win32's `SetFileInformationByHandle` would
+/// turn the name into a path from the current directory first.)
+fn rename_in(directory: &File, file: &File, name: &OsStr) -> io::Result<()> {
+    let name: Vec<u16> = name.encode_wide().collect();
+    let bytes = name.len() * 2;
+    let size = size_of::<FILE_RENAME_INFORMATION>() + bytes;
+    let length = u32::try_from(size).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "cache name too long")
+    })?;
+    // In words: aligned as the struct's handle is.
+    let mut buffer = vec![0_u64; size.div_ceil(8)];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `buffer` holds `size` bytes aligned for the struct: its fixed
+    // part, then room for the name from `FileName` on. No reference is
+    // made, so the name may run past the declared one-unit array.
+    unsafe {
+        (&raw mut (*info).RootDirectory).write(directory.as_raw_handle());
+        (&raw mut (*info).FileNameLength).write(bytes as u32);
+        (&raw mut (*info).FileName)
+            .cast::<u16>()
+            .copy_from_nonoverlapping(name.as_ptr(), name.len());
+    }
+    // POSIX semantics replace a cache a reader still holds open; a file
+    // system without them gets the plain rename.
+    let mut result = 0;
+    for (class, flags) in [
+        (FileRenameInformationEx, RENAME_REPLACE | RENAME_POSIX),
+        (FileRenameInformation, RENAME_REPLACE),
+    ] {
+        let mut status = IO_STATUS_BLOCK::default();
+        // SAFETY: as above; `Flags` shares its first byte with
+        // `ReplaceIfExists`. The handle is open with DELETE access, and
+        // `status` is a live local.
+        result = unsafe {
+            (&raw mut (*info).Anonymous.Flags).write(flags);
+            NtSetInformationFile(
+                file.as_raw_handle(),
+                &raw mut status,
+                info.cast_const().cast(),
+                length,
+                class,
+            )
+        };
+        if result >= 0 {
+            return Ok(());
+        }
+    }
+    Err(nt_error(result))
 }
 
 fn nt_error(status: i32) -> io::Error {
@@ -1174,6 +1285,31 @@ pub fn make_junction(link: &Path, target: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_failed_cache_write_leaves_the_last_one_and_nothing_beside_it() {
+        use std::io::{Read as _, Write as _};
+        let temp = TempDir::new().expect("tempdir");
+        // In a directory the write makes.
+        let path = temp.path().join("cache").join("walk.bin");
+        cache_write(&path, |out| out.write_all(b"whole")).expect("written");
+        let failed = cache_write(&path, |out| {
+            out.write_all(b"half")?;
+            Err(io::Error::other("stopped"))
+        });
+        assert!(failed.is_err());
+        let mut kept = String::new();
+        cache_read(&path)
+            .expect("kept")
+            .read_to_string(&mut kept)
+            .expect("read");
+        assert_eq!(kept, "whole");
+        let names: Vec<_> = fs::read_dir(path.parent().expect("dir"))
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["walk.bin"]);
+    }
 
     #[test]
     fn quoted_arguments_survive_the_command_line() {

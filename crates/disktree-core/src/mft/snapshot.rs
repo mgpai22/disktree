@@ -780,6 +780,22 @@ fn save(
     tree: &Flat,
     checkpoint: &Checkpoint,
 ) -> io::Result<()> {
+    // Written whole under another name, then renamed over the old one: a
+    // scan stopped halfway leaves the last good tree.
+    crate::windows::cache_write(file, |out| {
+        write_tree(out, serial, record, key, tree, checkpoint)
+    })
+}
+
+/// The tree, and where the next scan resumes from, into `out`.
+fn write_tree(
+    out: &mut File,
+    serial: u64,
+    record: usize,
+    key: u64,
+    tree: &Flat,
+    checkpoint: &Checkpoint,
+) -> io::Result<()> {
     let big = tree.largest(BIG_FILES);
     let numbers: Vec<u32> = checkpoint
         .open
@@ -787,13 +803,6 @@ fn save(
         .chain(&checkpoint.revisit)
         .copied()
         .collect();
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Written whole under another name, then renamed over the old one: a
-    // scan stopped halfway leaves the last good tree.
-    let partial = file.with_extension("partial");
-    let mut out = File::create(&partial)?;
     // Its whole length first: grown a piece at a time, the file cost the
     // file system an extension per megabyte.
     let length = HEADER
@@ -807,28 +816,22 @@ fn save(
     out.write_all(&[0; HEADER])?;
     let mut piece = Vec::with_capacity(PIECE);
     let mut sum =
-        write_region(&mut out, &tree.dirs, DIR, DIRS, encode_dir, &mut piece)?;
-    sum ^= write_region(
-        &mut out,
-        &tree.items,
-        ITEM,
-        ITEMS,
-        encode_item,
-        &mut piece,
-    )?;
+        write_region(out, &tree.dirs, DIR, DIRS, encode_dir, &mut piece)?;
+    sum ^=
+        write_region(out, &tree.items, ITEM, ITEMS, encode_item, &mut piece)?;
     for (index, part) in tree.text.chunks(PIECE).enumerate() {
         sum ^= checksum(TEXT, index, part);
         out.write_all(part)?;
     }
     sum ^= write_region(
-        &mut out,
+        out,
         &numbers,
         NUMBER,
         NUMBERS,
         |number, out| out.copy_from_slice(&number.to_le_bytes()),
         &mut piece,
     )?;
-    sum ^= write_region(&mut out, &big, BIG, BIGS, encode_big, &mut piece)?;
+    sum ^= write_region(out, &big, BIG, BIGS, encode_big, &mut piece)?;
     let mut header = Vec::with_capacity(HEADER);
     header.extend_from_slice(&MAGIC);
     for value in [
@@ -850,8 +853,7 @@ fn save(
     }
     out.seek(SeekFrom::Start(0))?;
     out.write_all(&header)?;
-    drop(out);
-    std::fs::rename(&partial, file)
+    Ok(())
 }
 
 /// Write `records`, `size` bytes each, a piece at a time through `piece`;

@@ -7,11 +7,9 @@
 //! damaged file, a count or name that cannot be) loads as nothing, and the
 //! caller walks again.
 
-use std::fs::File;
 use std::hash::Hasher as _;
 use std::io::{self, Read as _, Write as _};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use rayon::prelude::*;
 use rustc_hash::FxHasher;
@@ -77,9 +75,11 @@ pub(super) fn load(path: &Path) -> Option<State> {
 }
 
 /// Write `state` to `path`, whole or not at all: a failed or interrupted
-/// save leaves whatever was there before.
+/// save leaves whatever was there before. Not synced: a crash that loses
+/// the new bytes fails the checksum, and the next scan walks again.
 pub(super) fn save(path: &Path, state: &State) -> io::Result<()> {
-    replace(path, &encode(state)?)
+    let bytes = encode(state)?;
+    crate::windows::cache_write(path, |out| out.write_all(&bytes))
 }
 
 fn encode(state: &State) -> io::Result<Vec<u8>> {
@@ -486,31 +486,6 @@ fn checksum(bytes: &[u8]) -> u64 {
         hasher.write_u64(part);
     }
     hasher.finish()
-}
-
-/// Written whole under a name of this process's own, then renamed over
-/// `path`: a reader sees the old file or the new one, never half of one.
-/// Not synced: a crash that loses the new bytes fails the checksum, and
-/// the next scan walks again.
-fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    static SAVES: AtomicU64 = AtomicU64::new(0);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut partial = path.as_os_str().to_owned();
-    partial.push(format!(
-        ".{}-{}.partial",
-        std::process::id(),
-        SAVES.fetch_add(1, Ordering::Relaxed)
-    ));
-    let partial = PathBuf::from(partial);
-    let written = File::create(&partial)
-        .and_then(|mut out| out.write_all(bytes))
-        .and_then(|()| std::fs::rename(&partial, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&partial);
-    }
-    written
 }
 
 fn invalid(reason: &str) -> io::Error {
