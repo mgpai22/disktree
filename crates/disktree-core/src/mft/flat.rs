@@ -88,7 +88,9 @@ impl Tree {
     /// this returns: the directories whose entries changed and every one
     /// above them. `None` when the tree cannot be brought up to date from
     /// what it holds: a directory came into view whose entries it never
-    /// held, a directory has two names, or the changes do not make a tree.
+    /// held, a directory has two names, or the changes do not make a tree,
+    /// or make one deeper than a whole read goes. That holds the kept tree
+    /// too, which a scan resumes only through here.
     pub(super) fn patch(
         &mut self,
         numbers: &[u32],
@@ -336,6 +338,11 @@ impl Tree {
                 steps += 1;
             }
         }
+        // Nor deeper than a whole read goes: a folder moved takes all it
+        // holds down with it, and a kept tree comes only through here.
+        if !self.within_levels() {
+            return None;
+        }
 
         // Totals and order again for each changed directory and those
         // above it, deepest first, so each totals children already done.
@@ -540,6 +547,29 @@ impl Tree {
                         }
                 })
             })
+    }
+
+    /// Whether every directory the root reaches is fewer than
+    /// [`MOST_LEVELS`] below it, as a whole read of the table builds them,
+    /// so what walks a tree on a thread's stack is not too deep for it.
+    /// Only for a tree whose every directory is named once: a level at a
+    /// time from the root, each is then met once.
+    fn within_levels(&self) -> bool {
+        let mut level = vec![0_u64];
+        for _ in 0..MOST_LEVELS {
+            let next: Vec<u64> = level
+                .par_iter()
+                .filter_map(|&index| self.dir(index))
+                .flat_map_iter(|dir| self.run(dir))
+                .filter(|item| item.is_dir())
+                .map(|item| item.value)
+                .collect();
+            if next.is_empty() {
+                return true;
+            }
+            level = next;
+        }
+        false
     }
 }
 
@@ -1076,6 +1106,60 @@ mod tests {
             let mut tree = built(&before, &options);
             patch(&mut tree, &before, &made, &options).expect("patched");
             assert_eq!(lines(&tree), lines(&built(&made, &options)));
+        }
+    }
+
+    #[test]
+    fn a_tree_deeper_than_a_whole_read_goes_needs_a_whole_read() {
+        // Chain `a` is 900 folders deep, chain `b` 300; `b` moves into `a`.
+        let root = (ROOT, 5);
+        let mut before = Volume::new();
+        for (first, depth, name) in [(100, 900, "a"), (2000, 300, "b")] {
+            let mut parent = root;
+            for number in first..first + depth {
+                before.insert(number, dir(1, parent, name));
+                parent = (number, 1);
+            }
+        }
+        let options = ScanOptions::default();
+        for (holder, fits) in [(799, true), (999, false)] {
+            let mut after = before.clone();
+            after.insert(2000, dir(1, (holder, 1), "b"));
+            let mut tree = built(&before, &options);
+            let patched = patch(&mut tree, &before, &after, &options);
+            assert_eq!(patched.is_some(), fits, "beneath {holder}");
+        }
+
+        // A kept tree that deep is refused with no change at all.
+        let chain = |deepest: usize| Tree {
+            name: Box::default(),
+            dirs: (0..=deepest)
+                .map(|index| Dir {
+                    first: index as u32,
+                    len: u32::from(index < deepest),
+                    parent: index.checked_sub(1).map_or(NONE, |up| up as u32),
+                    ..Dir::EMPTY
+                })
+                .collect(),
+            segs: vec![Seg {
+                items: (1..=deepest)
+                    .map(|child| Item {
+                        kind: DIRECTORY,
+                        value: child as u64,
+                        len: 1,
+                        ..Item::default()
+                    })
+                    .collect(),
+                text: "d".to_owned(),
+            }],
+            volumes: vec![0],
+        };
+        for (deepest, fits) in [(MOST_LEVELS - 1, true), (MOST_LEVELS, false)] {
+            let mut tree = chain(deepest);
+            assert!(tree.is_valid());
+            let patched =
+                tree.patch(&[], &FxHashMap::default(), |_| false, &options);
+            assert_eq!(patched.is_some(), fits, "{deepest} deep");
         }
     }
 
