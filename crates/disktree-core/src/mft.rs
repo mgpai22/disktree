@@ -197,12 +197,19 @@ pub fn scan(
         .as_deref()
         .filter(|_| options.max_depth.is_none())
         .map(|dir| snapshot::file(dir, letter));
+    let journal = file.as_ref().and_then(|_| snapshot::query(&volume));
+    let resumed = file.as_deref().zip(journal).and_then(|(file, journal)| {
+        snapshot::resume(&volume, &geometry, journal, file, options)
+    });
+    if let Some(flat) = resumed {
+        return finished(
+            flat.tree(crate::scan::file_name(root), progress),
+            progress,
+        );
+    }
     // Where the journal stands before the read: the next scan picks up
     // there.
-    let checkpoint = file
-        .as_ref()
-        .and_then(|_| snapshot::query(&volume))
-        .map(Checkpoint::before);
+    let checkpoint = journal.map(Checkpoint::before);
     let (runs, bitmap) = table_layout(&volume, &geometry)?;
     let reads = plan_reads(
         &runs,
@@ -274,6 +281,15 @@ pub fn scan(
     // and they are freed in place.
     let _ = std::thread::Builder::new()
         .spawn(move || drop((infos, names, texts, starts)));
+    finished(tree, progress)
+}
+
+/// What a scan gives for `tree`: `None` when the walk has to measure
+/// instead.
+fn finished(
+    tree: Result<Node, Stop>,
+    progress: &ScanProgress,
+) -> Option<io::Result<Node>> {
     match tree {
         Ok(_) | Err(Stop) if progress.is_cancelled() => Some(Err(cancelled())),
         Ok(node) => Some(Ok(node)),

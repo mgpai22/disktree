@@ -1,18 +1,28 @@
 //! Keeping a scan's finished tree for the next one: the flat tree a whole
 //! read made, written to a file in the scan's cache directory, with where
-//! the volume's change journal stood when the read began.
+//! the volume's change journal stood when the read began. The next scan
+//! starts from it when the journal names no change since.
+//!
+//! Anything that does not line up gives up and reads the whole table: no
+//! journal, another journal (it was deleted and made again), a kept tree
+//! of another format, volume, record size or scan options, one that
+//! fails its checksum or is not a tree, or a journal that has since
+//! dropped the changes wanted.
 
 use std::fs::File;
-use std::io::{self, Seek as _, SeekFrom, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use rayon::prelude::*;
-use windows_sys::Win32::System::Ioctl::FSCTL_QUERY_USN_JOURNAL;
+use rustc_hash::FxHashSet;
+use windows_sys::Win32::System::Ioctl::{
+    FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
+};
 
-use super::flat::{Dir, Flat, Item};
-use super::{Geometry, u64_at};
+use super::flat::{Dir, Flat, Item, NONE};
+use super::{Geometry, REFERENCE, ReadExact as _, u16_at, u32_at, u64_at};
 use crate::scan::ScanOptions;
 use crate::tree::Metric;
 use crate::windows::control;
@@ -21,11 +31,15 @@ use crate::windows::control;
 /// older build is read again rather than trusted.
 const MAGIC: [u8; 8] = *b"dttree\x00\x02";
 
-/// The volume's change journal: which one, and the number (`USN`) of its
-/// next entry.
+/// Bytes of the journal read per call.
+const JOURNAL_BUFFER: usize = 1 << 20;
+
+/// The volume's change journal: which one, and the numbers (`USN`s) of its
+/// first and next entries.
 #[derive(Clone, Copy)]
 pub(super) struct Journal {
     id: u64,
+    first: u64,
     next: u64,
 }
 
@@ -56,10 +70,66 @@ pub(super) fn query(volume: &File) -> Option<Journal> {
     let out = out.get(..len)?;
     Some(Journal {
         id: u64_at(out, 0)?,
+        first: u64_at(out, 8)?,
         next: u64_at(out, 16)?,
     })
 }
 
+/// Every file the journal names from `from` on, and where it ended.
+/// `None` when the journal cannot be read from there: it has dropped those
+/// entries, or holds a kind this does not know.
+fn changes(
+    volume: &File,
+    journal: Journal,
+    from: u64,
+) -> Option<(FxHashSet<u32>, u64)> {
+    let mut files = FxHashSet::default();
+    let mut buffer = vec![0_u8; JOURNAL_BUFFER];
+    let mut at_usn = from;
+    loop {
+        // READ_USN_JOURNAL_DATA_V0: start, reasons, only on close, timeout,
+        // bytes to wait for, journal id.
+        let mut input = [0_u8; 40];
+        input[0..8].copy_from_slice(&at_usn.to_le_bytes());
+        input[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        input[32..40].copy_from_slice(&journal.id.to_le_bytes());
+        let len = control(volume, FSCTL_READ_USN_JOURNAL, &input, &mut buffer)
+            .ok()?;
+        let out = buffer.get(..len)?;
+        let next = u64_at(out, 0)?;
+        let mut at = 8;
+        while at < out.len() {
+            let length = u32_at(out, at)? as usize;
+            // Version 2 records, which a version 0 request gets on NTFS:
+            // 64-bit file references at 8.
+            if length < 60 || u16_at(out, at + 4)? != 2 {
+                return None;
+            }
+            let record = out.get(at..at + length)?;
+            let number = u32::try_from(u64_at(record, 8)? & REFERENCE).ok()?;
+            files.insert(number);
+            at += length;
+        }
+        if out.len() <= 8 || next <= at_usn {
+            return Some((files, next));
+        }
+        at_usn = next;
+    }
+}
+
+/// The last scan's tree, when the journal names no file changed since;
+/// `None` when a whole read is needed instead.
+pub(super) fn resume(
+    volume: &File,
+    geometry: &Geometry,
+    journal: Journal,
+    file: &Path,
+    options: &ScanOptions,
+) -> Option<Flat> {
+    let (flat, checkpoint) = load(file, geometry, journal, key(options))?;
+    let (files, _) = changes(volume, journal, checkpoint.next)?;
+    files.is_empty().then_some(flat)
+}
 /// A kept tree being written, which a scan waits for before it reads one.
 static SAVING: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
@@ -134,6 +204,22 @@ fn encode_dir(dir: &Dir, out: &mut [u8]) {
     out[44..52].copy_from_slice(&dir.modified.to_le_bytes());
 }
 
+fn decode_dir(bytes: &[u8]) -> Dir {
+    Dir {
+        record: u32_at(bytes, 0).unwrap_or(NONE),
+        sequence: u16_at(bytes, 4).unwrap_or(0),
+        first: u32_at(bytes, 6).unwrap_or(0),
+        len: u32_at(bytes, 10).unwrap_or(0),
+        parent: u32_at(bytes, 14).unwrap_or(NONE),
+        category: bytes.get(18).copied().unwrap_or(0),
+        reclaim: bytes.get(19).copied().unwrap_or(0),
+        bytes: u64_at(bytes, 20).unwrap_or(0),
+        files: u64_at(bytes, 28).unwrap_or(0),
+        dirs: u64_at(bytes, 36).unwrap_or(0),
+        modified: u64_at(bytes, 44).unwrap_or(0).cast_signed(),
+    }
+}
+
 fn encode_item(item: &Item, out: &mut [u8]) {
     out[0..4].copy_from_slice(&item.record.to_le_bytes());
     out[4..6].copy_from_slice(&item.sequence.to_le_bytes());
@@ -143,6 +229,20 @@ fn encode_item(item: &Item, out: &mut [u8]) {
     out[13] = u8::from(item.shared);
     out[14..22].copy_from_slice(&item.value.to_le_bytes());
     out[22..30].copy_from_slice(&item.modified.to_le_bytes());
+}
+
+fn decode_item(bytes: &[u8]) -> Item {
+    Item {
+        record: u32_at(bytes, 0).unwrap_or(0),
+        sequence: u16_at(bytes, 4).unwrap_or(0),
+        at: u32_at(bytes, 6).unwrap_or(0),
+        len: u16_at(bytes, 10).unwrap_or(0),
+        // Not a kind: a tree that holds it is refused.
+        kind: bytes.get(12).copied().unwrap_or(u8::MAX),
+        shared: bytes.get(13).is_some_and(|&shared| shared != 0),
+        value: u64_at(bytes, 14).unwrap_or(0),
+        modified: u64_at(bytes, 22).unwrap_or(0).cast_signed(),
+    }
 }
 
 fn save(
@@ -228,6 +328,161 @@ fn write_region<T: Sync>(
     Ok(sum)
 }
 
+/// The tree kept in `file`, if it is of this volume and these options and
+/// `journal` still reaches back to where it left off.
+fn load(
+    file: &Path,
+    geometry: &Geometry,
+    journal: Journal,
+    key: u64,
+) -> Option<(Flat, Checkpoint)> {
+    let kept = open(file, geometry, journal, key)?;
+    let flat = body(file, &kept)?;
+    Some((flat, kept.checkpoint))
+}
+
+/// A kept tree's header, read and checked before its body.
+struct Kept {
+    dirs: usize,
+    items: usize,
+    text: usize,
+    /// The checksum the whole file must have.
+    sum: u64,
+    checkpoint: Checkpoint,
+}
+
+/// The header of the tree kept in `file`: see [`load`].
+fn open(
+    file: &Path,
+    geometry: &Geometry,
+    journal: Journal,
+    key: u64,
+) -> Option<Kept> {
+    let mut input = File::open(file).ok()?;
+    let mut header = [0_u8; HEADER];
+    input.read_exact(&mut header).ok()?;
+    if header[..8] != MAGIC {
+        return None;
+    }
+    let value = |index: usize| u64_at(&header, 8 * (index + 1));
+    let count = |index: usize| usize::try_from(value(index)?).ok();
+    if value(0)? != geometry.serial
+        || value(1)? != geometry.record as u64
+        || value(4)? != key
+    {
+        return None;
+    }
+    let next = value(3)?;
+    if value(2)? != journal.id || next < journal.first || next > journal.next {
+        return None;
+    }
+    let (dirs, items, text) = (count(5)?, count(6)?, count(7)?);
+    // Sizes checked against the file before anything is allocated for
+    // them: a corrupt count must not ask for terabytes.
+    let length = dirs
+        .checked_mul(DIR)?
+        .checked_add(items.checked_mul(ITEM)?)?
+        .checked_add(text)?
+        .checked_add(HEADER)?;
+    if length != usize::try_from(input.metadata().ok()?.len()).ok()?
+        || [dirs, items, text]
+            .iter()
+            .any(|&count| count > u32::MAX as usize)
+    {
+        return None;
+    }
+    Some(Kept {
+        dirs,
+        items,
+        text,
+        sum: value(8)?,
+        checkpoint: Checkpoint {
+            journal: journal.id,
+            next,
+        },
+    })
+}
+
+/// The tree itself, if it matches its checksum and is a tree.
+fn body(file: &Path, kept: &Kept) -> Option<Flat> {
+    let mut at = HEADER;
+    // Room to grow: a patch appends, and growing a list of millions past
+    // its capacity copies it whole.
+    let (dirs, mut found) = read_region(
+        file,
+        at,
+        kept.dirs,
+        DIR,
+        DIRS,
+        kept.dirs / 32,
+        decode_dir,
+    )?;
+    at += kept.dirs * DIR;
+    let (items, sum) = read_region(
+        file,
+        at,
+        kept.items,
+        ITEM,
+        ITEMS,
+        kept.items / 32,
+        decode_item,
+    )?;
+    found ^= sum;
+    at += kept.items * ITEM;
+    let mut text = Vec::with_capacity(kept.text + kept.text / 32);
+    text.resize(kept.text, 0);
+    found ^= text
+        .par_chunks_mut(PIECE)
+        .enumerate()
+        .map(|(index, piece)| {
+            let offset = (at + index * PIECE) as u64;
+            File::open(file).ok()?.seek_read_exact(piece, offset).ok()?;
+            Some(checksum(TEXT, index, piece))
+        })
+        .collect::<Option<Vec<u64>>>()?
+        .into_iter()
+        .fold(0, |sum, piece| sum ^ piece);
+    let flat = Flat { dirs, items, text };
+    (found == kept.sum && flat.is_valid()).then_some(flat)
+}
+
+/// `count` records of `size` bytes at `offset` in `file`, read a piece at
+/// a time on every thread, through a handle of each thread's own, and
+/// decoded as they come: no copy of the file's bytes is kept. With their
+/// checksum.
+fn read_region<T: Clone + Default + Send + Sync>(
+    file: &Path,
+    offset: usize,
+    count: usize,
+    size: usize,
+    region: u64,
+    spare: usize,
+    decode: impl Fn(&[u8]) -> T + Sync + Send,
+) -> Option<(Vec<T>, u64)> {
+    let per = PIECE / size;
+    let mut records = Vec::with_capacity(count + spare);
+    records.par_extend(rayon::iter::repeat_n(T::default(), count));
+    let sums = records
+        .par_chunks_mut(per)
+        .enumerate()
+        .map_init(
+            || (File::open(file).ok(), Vec::new()),
+            |(input, bytes), (index, records)| {
+                bytes.resize(records.len() * size, 0);
+                let offset = (offset + index * per * size) as u64;
+                input.as_ref()?.seek_read_exact(bytes, offset).ok()?;
+                for (record, raw) in
+                    records.iter_mut().zip(bytes.chunks_exact(size))
+                {
+                    *record = decode(raw);
+                }
+                Some(checksum(region, index, bytes))
+            },
+        )
+        .collect::<Option<Vec<u64>>>()?;
+    Some((records, sums.into_iter().fold(0, |sum, piece| sum ^ piece)))
+}
+
 /// A check a torn or damaged piece of the file fails. Four lanes of
 /// 64-bit words, so the multiplies overlap: a quarter of the time one
 /// chain of them took.
@@ -250,4 +505,132 @@ fn checksum(region: u64, index: usize, bytes: &[u8]) -> u64 {
         sum = (sum.rotate_left(8) ^ u64::from(byte)).wrapping_mul(MIX);
     }
     sum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::flat::{DIRECTORY, FILE};
+    use super::*;
+
+    const JOURNAL: Journal = Journal {
+        id: 0xABCD,
+        first: 1000,
+        next: 200_000,
+    };
+
+    fn geometry(serial: u64) -> Geometry {
+        Geometry {
+            cluster: 4096,
+            record: 1024,
+            mft_offset: 0,
+            volume: 1 << 30,
+            serial,
+        }
+    }
+
+    /// The root holding `sub` and `résumé.txt`, a file with two names, and
+    /// `sub` holding `file.txt`.
+    fn tree() -> Flat {
+        let dir = |record, first, len, parent, bytes| Dir {
+            record,
+            sequence: 1,
+            first,
+            len,
+            parent,
+            category: 8,
+            reclaim: 0,
+            bytes,
+            files: len.into(),
+            dirs: 1,
+            modified: 9,
+        };
+        let item = |record, at, len, kind, value| Item {
+            record,
+            sequence: 3,
+            at,
+            len,
+            kind,
+            shared: record == 30,
+            value,
+            modified: 7,
+        };
+        Flat {
+            dirs: vec![dir(5, 0, 2, NONE, 12_288), dir(20, 2, 1, 0, 4096)],
+            items: vec![
+                item(30, 3, 12, FILE, 8192),
+                item(20, 0, 3, DIRECTORY, 1),
+                item(31, 15, 8, FILE, 4096),
+            ],
+            text: "subr\u{e9}sum\u{e9}.txtfile.txt".as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_kept_tree_reads_back_as_written_and_a_damaged_one_not_at_all() {
+        let options = ScanOptions::default();
+        let checkpoint = Checkpoint {
+            journal: 0xABCD,
+            next: 123_456,
+        };
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = file(dir.path(), 'C');
+        let key = key(&options);
+        let saved = tree();
+        assert!(saved.is_valid());
+        save(&file, 7, 1024, key, &saved, &checkpoint).expect("saved");
+
+        let (loaded, kept) =
+            load(&file, &geometry(7), JOURNAL, key).expect("loads");
+        assert_eq!(
+            (&loaded.dirs, &loaded.items, &loaded.text),
+            (&saved.dirs, &saved.items, &saved.text)
+        );
+        assert_eq!((kept.journal, kept.next), (0xABCD, 123_456));
+
+        // Another volume's, a table of another record size, or a scan
+        // with other options is not this one's.
+        assert!(load(&file, &geometry(8), JOURNAL, key).is_none());
+        let other = Geometry {
+            record: 4096,
+            ..geometry(7)
+        };
+        assert!(load(&file, &other, JOURNAL, key).is_none());
+        let apparent = ScanOptions {
+            apparent_size: true,
+            ..ScanOptions::default()
+        };
+        assert!(
+            load(&file, &geometry(7), JOURNAL, super::key(&apparent)).is_none()
+        );
+        // Nor is one the journal no longer reaches back to, or another
+        // journal's.
+        let wrapped = Journal {
+            first: 200_000,
+            ..JOURNAL
+        };
+        assert!(load(&file, &geometry(7), wrapped, key).is_none());
+        let remade = Journal { id: 1, ..JOURNAL };
+        assert!(load(&file, &geometry(7), remade, key).is_none());
+
+        // A damaged byte fails the checksum; a short file its length.
+        let bytes = std::fs::read(&file).expect("read");
+        let mut damaged = bytes.clone();
+        let middle = damaged.len() / 2 + HEADER / 2;
+        damaged[middle] ^= 0x10;
+        std::fs::write(&file, &damaged).expect("write");
+        assert!(load(&file, &geometry(7), JOURNAL, key).is_none());
+        std::fs::write(&file, &bytes[..bytes.len() - 1]).expect("write");
+        assert!(load(&file, &geometry(7), JOURNAL, key).is_none());
+
+        // Nor is one that is not a tree: a folder named twice would be
+        // built twice, each time for every level such names repeat.
+        let mut twice = tree();
+        twice.items[0] = twice.items[1];
+        assert!(!twice.is_valid());
+        save(&file, 7, 1024, key, &twice, &checkpoint).expect("saved");
+        assert!(load(&file, &geometry(7), JOURNAL, key).is_none());
+        let mut elsewhere = tree();
+        elsewhere.dirs[1].parent = 1;
+        assert!(!elsewhere.is_valid());
+    }
 }

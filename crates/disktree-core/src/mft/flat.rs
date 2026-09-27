@@ -75,6 +75,10 @@ impl Dir {
         }
     }
 
+    const fn is_live(&self) -> bool {
+        self.record != NONE
+    }
+
     /// Add an entry's totals: see [`Flat::totals`].
     fn add(&mut self, (bytes, files, dirs, modified): (u64, u64, u64, i64)) {
         // Saturating: a corrupt volume's file table can claim any size.
@@ -428,6 +432,55 @@ impl Flat {
         for item in run {
             child(item, out);
         }
+    }
+
+    /// Whether this is a tree: every run and name in bounds, every
+    /// directory named once, by an entry of the directory it says holds
+    /// it, and the root by none. A kept tree is a file another program can
+    /// write, and must not become a tree that never ends.
+    pub(super) fn is_valid(&self) -> bool {
+        let named: Vec<AtomicBool> =
+            std::iter::repeat_with(|| AtomicBool::new(false))
+                .take(self.dirs.len())
+                .collect();
+        let in_bounds = |item: &Item| {
+            self.text
+                .get(item.at as usize..)
+                .and_then(|rest| rest.get(..usize::from(item.len)))
+                .is_some()
+        };
+        self.dirs
+            .first()
+            .is_some_and(|root| root.is_live() && root.parent == NONE)
+            && self.dirs.par_iter().enumerate().all(|(index, dir)| {
+                if !dir.is_live() {
+                    return dir.len == 0;
+                }
+                let Some(run) = self
+                    .items
+                    .get(dir.first as usize..)
+                    .and_then(|rest| rest.get(..dir.len as usize))
+                else {
+                    return false;
+                };
+                run.iter().all(|item| {
+                    in_bounds(item)
+                        && match item.kind {
+                            FILE | LINK => true,
+                            DIRECTORY => usize::try_from(item.value)
+                                .ok()
+                                .filter(|&child| child != 0)
+                                .is_some_and(|child| {
+                                    self.dirs.get(child).is_some_and(|sub| {
+                                        sub.is_live()
+                                            && sub.parent as usize == index
+                                    }) && !named[child]
+                                        .swap(true, Ordering::Relaxed)
+                                }),
+                            _ => false,
+                        }
+                })
+            })
     }
 }
 
