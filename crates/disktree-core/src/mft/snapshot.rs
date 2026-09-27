@@ -309,23 +309,61 @@ fn moved(
     numbers: &[u32],
     options: &ScanOptions,
 ) -> Vec<u32> {
-    big.par_iter()
+    let wanted: Vec<&(u32, u16, u64)> = big
+        .iter()
         .filter(|(number, ..)| numbers.binary_search(number).is_err())
-        .filter(|&&(number, sequence, shown)| {
-            let reference = u64::from(number) | u64::from(sequence) << 48;
-            sizes_by_id(volume, reference).ok().is_none_or(
-                |(length, allocated)| {
-                    shown
-                        != if options.apparent_size {
-                            length
-                        } else {
-                            allocated
-                        }
-                },
-            )
-        })
-        .map(|&(number, ..)| number)
-        .collect()
+        .collect();
+    on_threads(&wanted, |_, wanted| {
+        Some(
+            wanted
+                .iter()
+                .filter(|&&&(number, sequence, shown)| {
+                    let reference =
+                        u64::from(number) | u64::from(sequence) << 48;
+                    sizes_by_id(volume, reference).ok().is_none_or(
+                        |(length, allocated)| {
+                            shown
+                                != if options.apparent_size {
+                                    length
+                                } else {
+                                    allocated
+                                }
+                        },
+                    )
+                })
+                .map(|&&(number, ..)| number)
+                .collect::<Vec<u32>>(),
+        )
+    })
+    .map_or_else(Vec::new, |lists| lists.into_iter().flatten().collect())
+}
+
+/// `work` done on each of as many slices of `all` as the scan has
+/// threads, given its place and each on a thread of its own; `None` if any
+/// gave none. For work that waits on the file system: requests on one
+/// handle opened without overlapped I/O run one at a time, and a scan's
+/// worker waiting is one its other work cannot have.
+fn on_threads<T: Sync, R: Send>(
+    all: &[T],
+    work: impl Fn(usize, &[T]) -> Option<R> + Sync,
+) -> Option<Vec<R>> {
+    if all.is_empty() {
+        return Some(Vec::new());
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let per = all.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let work = &work;
+        let handles: Vec<_> = all
+            .chunks(per)
+            .enumerate()
+            .map(|(index, slice)| scope.spawn(move || work(index, slice)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect()
+    })
 }
 
 /// What re-reading `numbers` found: per list, the base records' facts and
@@ -338,18 +376,22 @@ fn read_again(
     geometry: &Geometry,
     numbers: &[u32],
 ) -> Option<Lists> {
-    let volume = open_volume(path).ok()?;
-    let mut out = Parsed::default();
-    let mut bases = Vec::with_capacity(numbers.len());
-    let mut buffer = Vec::new();
-    for &number in numbers {
-        if let Some(info) =
-            reparse(&volume, geometry, number, 0, &mut buffer, &mut out).ok()?
-        {
-            bases.push((number, info));
+    on_threads(numbers, |chunk, numbers| {
+        let chunk = u32::try_from(chunk).ok()?;
+        let volume = open_volume(path).ok()?;
+        let mut out = Parsed::default();
+        let mut bases = Vec::with_capacity(numbers.len());
+        let mut buffer = Vec::new();
+        for &number in numbers {
+            if let Some(info) =
+                reparse(&volume, geometry, number, chunk, &mut buffer, &mut out)
+                    .ok()?
+            {
+                bases.push((number, info));
+            }
         }
-    }
-    Some(vec![(bases, out)])
+        Some((bases, out))
+    })
 }
 
 /// Replace what `state` holds for each of `numbers` by what its record
