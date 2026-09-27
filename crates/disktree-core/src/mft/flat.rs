@@ -427,8 +427,9 @@ impl Tree {
     }
 
     /// The tree without what patches left behind, in one segment, its
-    /// directories in the order a walk from the root meets them.
-    pub(super) fn compact(&self) -> Self {
+    /// directories in the order a walk from the root meets them; `None`
+    /// when one segment cannot number all it holds.
+    pub(super) fn compact(&self) -> Option<Self> {
         let items = self.segs.iter().map(|seg| seg.items.len()).sum();
         let text = self.segs.iter().map(|seg| seg.text.len()).sum();
         let mut into = Seg {
@@ -437,18 +438,18 @@ impl Tree {
         };
         let mut dirs = Vec::with_capacity(self.dirs.len());
         let Some(&root) = self.dirs.first() else {
-            return Self::default();
+            return Some(Self::default());
         };
         dirs.push(root);
         // Where each directory of `dirs` was.
         let mut from = vec![0_u64];
         let mut at = 0;
         while let Some(dir) = from.get(at).and_then(|&old| self.dir(old)) {
-            let first = into.items.len() as u32;
+            let first = u32::try_from(into.items.len()).ok()?;
             for item in self.run(dir) {
                 let mut item = *item;
                 let name = self.text(dir.seg, &item);
-                item.at = into.text.len() as u32;
+                item.at = u32::try_from(into.text.len()).ok()?;
                 into.text.push_str(name);
                 if item.is_dir() {
                     let Some(child) = self.dir(item.value) else {
@@ -457,7 +458,7 @@ impl Tree {
                     from.push(item.value);
                     item.value = dirs.len() as u64;
                     dirs.push(Dir {
-                        parent: at as u32,
+                        parent: u32::try_from(at).ok()?,
                         ..*child
                     });
                 }
@@ -466,15 +467,15 @@ impl Tree {
             let dir = &mut dirs[at];
             dir.seg = 0;
             dir.first = first;
-            dir.len = into.items.len() as u32 - first;
+            dir.len = u32::try_from(into.items.len()).ok()? - first;
             at += 1;
         }
-        Self {
+        Some(Self {
             name: self.name.clone(),
             dirs,
             segs: vec![into],
             volumes: self.volumes.clone(),
-        }
+        })
     }
 
     /// `(record, sequence, size)` of the `count` largest files the tree
@@ -722,7 +723,10 @@ impl Table<'_> {
         let first = if subdirs.is_empty() {
             0
         } else {
-            build.reserve(subdirs.len() as u32).ok_or(Stop)?
+            u32::try_from(subdirs.len())
+                .ok()
+                .and_then(|count| build.reserve(count))
+                .ok_or(Stop)?
         };
         let fill =
             |(at, &(child, child_sequence, _)): (usize, &(u32, u16, usize))| {
@@ -784,7 +788,7 @@ impl Table<'_> {
             ..Dir::EMPTY
         };
         dir.set_totals(totals);
-        build.place(index, dir, run.into_iter(), text);
+        build.place(index, dir, run.into_iter(), text).ok_or(Stop)?;
         Ok(totals)
     }
 }
@@ -1026,10 +1030,11 @@ mod tests {
             let expected = built(&after, &options);
             assert_eq!(lines(&tree), lines(&expected));
             // And again from what a save keeps.
-            assert_eq!(lines(&tree.compact()), lines(&expected));
+            let compact = tree.compact().expect("compact");
+            assert_eq!(lines(&compact), lines(&expected));
             assert!(tree.has_garbage());
-            assert!(!tree.compact().has_garbage());
-            assert!(tree.compact().is_valid());
+            assert!(!compact.has_garbage());
+            assert!(compact.is_valid());
         }
         let expected = built(&after, &exact());
         let named = |path: &[&str]| {
@@ -1353,7 +1358,7 @@ mod tests {
                 );
                 // A save now and then, as a resumed scan makes.
                 if round % 7 == 0 {
-                    tree = tree.compact();
+                    tree = tree.compact().expect("compact");
                     assert!(tree.is_valid());
                 }
             }

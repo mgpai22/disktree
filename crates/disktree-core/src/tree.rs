@@ -987,10 +987,13 @@ impl Builder {
     }
 
     /// Places for `count` more directories, numbered from the one this
-    /// returns; `None` past what a tree can number.
+    /// returns; `None` past what a tree can number, taking none.
     pub(crate) fn reserve(&self, count: u32) -> Option<u32> {
-        let first = self.next_dir.fetch_add(count, Ordering::Relaxed);
-        (first.checked_add(count)? < NONE).then_some(first)
+        self.next_dir
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |first| {
+                first.checked_add(count).filter(|&end| end < NONE)
+            })
+            .ok()
     }
 
     /// `volume`'s number in the tree; `None` past what an item can number.
@@ -1013,26 +1016,29 @@ impl Builder {
     }
 
     /// Directory `index` is `dir`, and its entries are `run`, in order,
-    /// with `text` bytes of names between them.
+    /// with `text` bytes of names between them. `None` for a run no
+    /// segment can hold: more entries or name bytes than 32 bits number,
+    /// or a name longer than an entry keeps.
     pub(crate) fn place<'n>(
         &self,
         index: u32,
         mut dir: Dir,
         run: impl ExactSizeIterator<Item = (Item, &'n str)>,
         text: usize,
-    ) {
+    ) -> Option<()> {
         let count = run.len();
+        dir.len = u32::try_from(count).ok()?;
+        u32::try_from(text).ok()?;
         let slot = rayon::current_thread_index().unwrap_or(0) % self.open.len();
         if count >= CHUNK_ITEMS / 8 || text >= CHUNK_TEXT / 8 {
             let seg = self.next_seg.fetch_add(1, Ordering::Relaxed);
             let mut chunk = Chunk::new(seg, count, text);
             dir.seg = seg;
             dir.first = 0;
-            dir.len = count as u32;
-            push(&mut chunk, run);
+            push(&mut chunk, run)?;
             crate::scan::lock(&self.done).push(chunk);
             crate::scan::lock(&self.open[slot]).dirs.push((index, dir));
-            return;
+            return Some(());
         }
         let mut slot = crate::scan::lock(&self.open[slot]);
         let Slot { chunk, dirs } = &mut *slot;
@@ -1047,11 +1053,11 @@ impl Builder {
             }
         }
         dir.seg = chunk.seg;
-        dir.first = chunk.items.len() as u32;
-        dir.len = count as u32;
-        push(chunk, run);
+        dir.first = u32::try_from(chunk.items.len()).ok()?;
+        push(chunk, run)?;
         dirs.push((index, dir));
         drop(slot);
+        Some(())
     }
 
     /// The tree, its root named `name`: everything placed so far, which
@@ -1099,14 +1105,19 @@ impl Builder {
     }
 }
 
-/// Append `run` to `chunk`, each name after the last.
-fn push<'n>(chunk: &mut Chunk, run: impl Iterator<Item = (Item, &'n str)>) {
+/// Append `run` to `chunk`, each name after the last; `None` at a name
+/// that starts past what 32 bits number, or is longer than 16 bits say.
+fn push<'n>(
+    chunk: &mut Chunk,
+    run: impl Iterator<Item = (Item, &'n str)>,
+) -> Option<()> {
     for (mut item, name) in run {
-        item.at = chunk.text.len() as u32;
-        item.len = name.len() as u16;
+        item.at = u32::try_from(chunk.text.len()).ok()?;
+        item.len = u16::try_from(name.len()).ok()?;
         chunk.text.push_str(name);
         chunk.items.push(item);
     }
+    Some(())
 }
 
 /// Identities a scan has met.
@@ -1363,6 +1374,15 @@ mod tests {
     }
 
     #[test]
+    fn a_reserve_past_what_a_tree_numbers_takes_nothing() {
+        let builder = Builder::new(1);
+        assert_eq!(builder.reserve(NONE), None);
+        assert_eq!(builder.reserve(2), Some(0));
+        assert_eq!(builder.reserve(NONE - 2), None);
+        assert_eq!(builder.reserve(1), Some(2));
+    }
+
+    #[test]
     fn threads_building_at_once_make_one_tree() {
         let builder = Builder::new(4);
         let root = builder.reserve(1).expect("root");
@@ -1384,7 +1404,7 @@ mod tests {
                 files: 300,
                 ..Dir::EMPTY
             };
-            builder.place(base + index, dir, run, text);
+            builder.place(base + index, dir, run, text).expect("placed");
         });
         let items = (0..64_u32).map(|index| {
             let item = Item {
@@ -1394,7 +1414,7 @@ mod tests {
             };
             (item, "d")
         });
-        builder.place(root, Dir::EMPTY, items, 64);
+        builder.place(root, Dir::EMPTY, items, 64).expect("placed");
         let mut tree = builder.finish("root".into());
         tree.settle(root, Metric::Bytes);
         let root = tree.root();

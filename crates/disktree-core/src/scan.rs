@@ -854,12 +854,31 @@ impl PendingDir {
             dir.volume = volume;
             dir.flags |= IDENTIFIED;
         }
-        context.build.place(
+        let placed = context.build.place(
             self.index,
             dir,
             run.iter().map(|item| (*item, name_in(&text, item))),
             text.len(),
         );
+        if placed.is_none() {
+            // More entries or names than one run can hold, which no real
+            // directory has: shown unreadable, what it holds unknown.
+            context.progress.record_error(
+                &self.path,
+                &io::Error::other("more entries than a tree can hold"),
+            );
+            let empty = Dir {
+                parent: dir.parent,
+                id: dir.id,
+                volume: dir.volume,
+                flags: dir.flags | READ_ERROR,
+                ..Dir::EMPTY
+            };
+            context
+                .build
+                .place(self.index, empty, std::iter::empty(), 0);
+            return (Totals::DIRECTORY, 0);
+        }
         (totals, dir.key(metric))
     }
 }
@@ -1161,7 +1180,9 @@ fn walk<'scope>(
     let first = if subdirs.is_empty() {
         None
     } else {
-        context.build.reserve(subdirs.len() as u32)
+        u32::try_from(subdirs.len())
+            .ok()
+            .and_then(|count| context.build.reserve(count))
     };
     if let Some(first) = first {
         for (index, subdir) in (first..).zip(&subdirs) {
@@ -1268,7 +1289,7 @@ impl WalkContext {
             }
             at += 1;
         }
-        let first = self.build.reserve(order_of.len() as u32)?;
+        let first = self.build.reserve(u32::try_from(order_of.len()).ok()?)?;
         let mut sums = vec![Totals::default(); order_of.len()];
         // Deepest first, so each directory totals children already done.
         for (at, &(old, up)) in order_of.iter().enumerate().rev() {
@@ -1342,7 +1363,7 @@ impl WalkContext {
                 placed_dir,
                 run.iter().map(|item| (*item, name_in(text, item))),
                 bytes,
-            );
+            )?;
             sums[at] = total;
         }
         Some((first, sums[0]))

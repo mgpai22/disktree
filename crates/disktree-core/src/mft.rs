@@ -352,12 +352,13 @@ pub fn scan(
     {
         let tree = Arc::clone(tree);
         snapshot::save_later(file, &geometry, options, checkpoint, move || {
-            // What patches left behind is not worth keeping.
-            Some(if tree.has_garbage() {
-                Arc::new(tree.compact())
+            // What patches left behind is not worth keeping; nor is a tree
+            // too large for one segment kept at all.
+            if tree.has_garbage() {
+                tree.compact().map(Arc::new)
             } else {
-                tree
-            })
+                Some(tree)
+            }
         });
     }
     match tree {
@@ -1255,7 +1256,7 @@ fn merge(
 }
 
 /// Why a tree was not made: the scan was cancelled, or the tree runs
-/// deeper than [`MOST_LEVELS`].
+/// deeper than [`MOST_LEVELS`], or holds more than it can number.
 struct Stop;
 
 /// What a whole read of the table found, ready for `flat` to build the
