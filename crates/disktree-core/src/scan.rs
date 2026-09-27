@@ -855,6 +855,14 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
 
     #[cfg(windows)]
     let cache = walk_cache::Checkpoint::open(canonical, context);
+    #[cfg(windows)]
+    if let Some(cache) = &cache
+        && let Some(mut tree) = WALK_POOL.install(|| cache.resume(context))
+    {
+        tree.name = file_name(root);
+        context.progress.settle(tree.files, tree.dirs, tree.bytes);
+        return Ok(tree);
+    }
     let root_dir = Arc::new(PendingDir::new(
         root.to_path_buf(),
         file_name(root),
