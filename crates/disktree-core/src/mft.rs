@@ -22,6 +22,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -558,12 +560,14 @@ fn table(reads: &[(u64, u64, u64)], record: usize) -> Vec<Info> {
 
 /// Read and parse every used record, each into its slot of `infos`.
 /// Reads run in parallel: one at a time leaves a solid-state disk idle
-/// between requests. One list of reads per thread, each with its own
-/// volume handle and buffer: requests on one handle opened without
-/// overlapped I/O run one at a time, and rayon's `map_init` would open a
-/// handle and zero a buffer per split, hundreds of times. Read `i` goes to
-/// list `i % threads`, so the lists move through the disk together.
-/// Results come back in read order, which `merge` relies on.
+/// between requests. One worker per thread, each with its own volume
+/// handle and buffer: requests on one handle opened without overlapped
+/// I/O run one at a time, and rayon's `map_init` would open a handle and
+/// zero a buffer per split, hundreds of times. Workers take reads from one
+/// queue, largest first: dealt out in advance, one worker's share ran on
+/// after the others were done, and a 16 MiB read taken last kept every
+/// other thread waiting on it. Results come back in read order, which
+/// `merge` relies on.
 ///
 /// Records land in `infos` as they are parsed, while other reads are
 /// still on the disk: gathered into it after the last read, they cost a
@@ -577,44 +581,41 @@ fn read_records(
     progress: &ScanProgress,
 ) -> Option<Vec<Parsed>> {
     let threads = rayon::current_num_threads().max(1);
-    let mut stretches: Vec<Vec<&mut [Info]>> =
-        (0..threads).map(|_| Vec::new()).collect();
     // `plan_reads` gives them in record order, none overlapping.
+    let mut stretches = Vec::with_capacity(reads.len());
     let mut rest = infos;
     let mut done = 0;
-    for (index, &(_, size, first)) in reads.iter().enumerate() {
+    for &(_, size, first) in reads {
         let skip = usize::try_from(first).ok()?.checked_sub(done)?;
         let count = usize::try_from(size).ok()? / record;
         let (stretch, tail) =
             rest.get_mut(skip..)?.split_at_mut_checked(count)?;
-        stretches[index % threads].push(stretch);
+        stretches.push(Mutex::new(Some(stretch)));
         rest = tail;
         done += skip + count;
     }
-    let lists = stretches
+    let mut order: Vec<usize> = (0..reads.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(reads[index].1));
+    let next = AtomicUsize::new(0);
+    let lists = (0..threads)
         .into_par_iter()
-        .enumerate()
-        .map(|(list, stretches)| {
+        .map(|_| {
             let volume = open_volume(path).ok()?;
             let mut buffer = Aligned::default();
             let mut parsed = Vec::new();
-            for ((chunk, &(offset, size, first)), stretch) in reads
-                .iter()
-                .enumerate()
-                .skip(list)
-                .step_by(threads)
-                .zip(stretches)
+            while !progress.is_cancelled()
+                && let Some(&index) =
+                    order.get(next.fetch_add(1, Ordering::Relaxed))
             {
-                if progress.is_cancelled() {
-                    break;
-                }
+                let (offset, size, first) = reads[index];
+                let stretch = crate::scan::lock(&stretches[index]).take()?;
                 let buffer = buffer.bytes(usize::try_from(size).ok()?);
                 volume.seek_read_exact(buffer, offset).ok()?;
                 let chunk = parse_chunk(
                     buffer,
                     record,
                     first,
-                    u32::try_from(chunk).ok()?,
+                    u32::try_from(index).ok()?,
                     stretch,
                 );
                 let bytes = if apparent_size {
@@ -623,22 +624,18 @@ fn read_records(
                     chunk.allocated
                 };
                 progress.add(chunk.files, 0, bytes);
-                parsed.push(chunk);
+                parsed.push((index, chunk));
             }
             Some(parsed)
         })
         .collect::<Option<Vec<_>>>()?;
-    // Interleave back: read `i` is item `i / threads` of list `i % threads`.
-    let mut lists: Vec<_> = lists.into_iter().map(Vec::into_iter).collect();
-    let mut parsed = Vec::with_capacity(reads.len());
-    for index in 0..reads.len() {
-        // Short only when cancelled, which the caller checks next.
-        let Some(chunk) = lists[index % threads].next() else {
-            break;
-        };
-        parsed.push(chunk);
+    let mut slots: Vec<Option<Parsed>> =
+        std::iter::repeat_with(|| None).take(reads.len()).collect();
+    for (index, chunk) in lists.into_iter().flatten() {
+        slots[index] = Some(chunk);
     }
-    Some(parsed)
+    // Short only when cancelled, which the caller checks next.
+    Some(slots.into_iter().map_while(|chunk| chunk).collect())
 }
 
 /// `len` bytes at `offset`. Read as whole, aligned 4 KiB blocks: past the
