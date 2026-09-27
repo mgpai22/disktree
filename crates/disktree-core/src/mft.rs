@@ -162,7 +162,8 @@ struct Geometry {
 }
 
 /// The tree under `root`, read from the volume's file table; `None` when
-/// the table cannot be read and the walk has to measure instead.
+/// the table cannot be read and the walk has to measure instead. The tree
+/// comes back finished: totalled, ordered and classified.
 pub fn scan(
     root: &Path,
     canonical: &Path,
@@ -215,9 +216,10 @@ pub fn scan(
         progress,
         seen: options.dedup_hardlinks.then(Seen::new),
     };
-    let tree = table
-        .build()
-        .and_then(|flat| flat.tree(crate::scan::file_name(root), progress));
+    let tree = table.build().and_then(|mut flat| {
+        flat.classify();
+        flat.tree(crate::scan::file_name(root), progress)
+    });
     // Hundreds of megabytes, whose freeing the caller would otherwise
     // wait out before it can finish the tree.
     let Table {
@@ -1096,9 +1098,9 @@ mod tests {
 
     /// The tree a table makes, the way a scan makes it.
     fn tree_of(table: &Table<'_>) -> Result<Node, Stop> {
-        let mut node = table.build()?.tree("C:".into(), table.progress)?;
-        crate::classify::classify(&mut node);
-        Ok(node)
+        let mut flat = table.build()?;
+        flat.classify();
+        flat.tree("C:".into(), table.progress)
     }
 
     const RECORD: usize = 1024;

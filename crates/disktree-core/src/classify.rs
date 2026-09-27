@@ -93,6 +93,21 @@ pub enum Reclaim {
 }
 
 impl Reclaim {
+    /// Every reason, in declaration order: what a kept tree numbers them by.
+    /// Only the Windows file table reader keeps a tree.
+    #[cfg(windows)]
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Regenerable,
+        Self::SyncHistory,
+        Self::PackageStore,
+        Self::BuildOutput,
+        Self::Reinstallable,
+        Self::SandboxLayers,
+        Self::Snapshots,
+        Self::Trash,
+        Self::Temporary,
+    ];
+
     /// The reason, as the "Worth a look" list says it.
     pub const fn label(self) -> &'static str {
         match self {

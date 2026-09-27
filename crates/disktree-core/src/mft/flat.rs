@@ -1,6 +1,6 @@
-//! The tree as flat arrays: what a read of the file table shows, totalled
-//! and ordered, in a form that is cheap to keep and to turn into
-//! [`Node`]s.
+//! The tree as flat arrays: what a read of the file table shows,
+//! totalled, ordered and classified, in a form that is cheap to keep and
+//! to turn into [`Node`]s.
 //!
 //! Every directory is a [`Dir`] and its entries a run of [`Item`]s, in the
 //! order the tree shows them; names sit in one arena.
@@ -16,6 +16,10 @@ use super::{
     EVICTED, Entry, FIRST_USER_RECORD, Info, MOST_LEVELS, NAME_SURROGATE, ROOT,
     Stop, Table,
 };
+use crate::classify::{
+    Category, GIT_STORE, Reclaim, category_of_name, directory_kind,
+    top_level_kind,
+};
 use crate::scan::{ScanOptions, ScanProgress};
 use crate::tree::{Metric, Node, NodeKind};
 
@@ -26,6 +30,12 @@ pub(super) const NONE: u32 = u32::MAX;
 pub(super) const FILE: u8 = 0;
 pub(super) const LINK: u8 = 1;
 pub(super) const DIRECTORY: u8 = 2;
+
+/// A kind not decided yet: every directory of a tree just built.
+const UNSET: u8 = u8::MAX;
+
+/// A directory's [`Category`] and [`Reclaim`], by number: see [`code`].
+type Kind = (u8, u8);
 
 /// A directory of the tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,6 +49,8 @@ pub(super) struct Dir {
     pub len: u32,
     /// The directory holding it; [`NONE`] for the root.
     pub parent: u32,
+    pub category: u8,
+    pub reclaim: u8,
     /// Totals as its node has them.
     pub bytes: u64,
     pub files: u64,
@@ -54,6 +66,8 @@ impl Dir {
             first: 0,
             len: 0,
             parent: NONE,
+            category: UNSET,
+            reclaim: UNSET,
             bytes: 0,
             files: 0,
             dirs: 1,
@@ -135,6 +149,28 @@ const fn is_link(info: &Info) -> bool {
         && info.reparse_tag & NAME_SURROGATE != 0
 }
 
+fn code(category: Category, reclaim: Option<Reclaim>) -> Kind {
+    let category = Category::LEGEND
+        .iter()
+        .position(|&known| known == category)
+        .unwrap_or(Category::LEGEND.len());
+    let reclaim = reclaim
+        .and_then(|reclaim| Reclaim::ALL.iter().position(|&r| r == reclaim))
+        .map_or(0, |index| index + 1);
+    (category as u8, reclaim as u8)
+}
+
+fn decode((category, reclaim): Kind) -> (Category, Option<Reclaim>) {
+    let category = Category::LEGEND
+        .get(usize::from(category))
+        .copied()
+        .unwrap_or(Category::Other);
+    let reclaim = reclaim
+        .checked_sub(1)
+        .and_then(|index| Reclaim::ALL.get(usize::from(index)).copied());
+    (category, reclaim)
+}
+
 /// Largest first, then by name: `tree::settle_directory`'s order.
 fn order(
     (left_key, left_name): (u64, &[u8]),
@@ -189,6 +225,38 @@ impl Flat {
         })
     }
 
+    fn has(&self, run: &[Item], wanted: &str) -> bool {
+        run.iter()
+            .any(|item| name_of(&self.text, item) == wanted.as_bytes())
+    }
+
+    /// See `classify::is_git_store`.
+    fn is_git_store(&self, index: u64) -> bool {
+        self.dir(index).is_some_and(|dir| {
+            let run = self.run(dir);
+            GIT_STORE.iter().all(|wanted| self.has(run, wanted))
+        })
+    }
+
+    /// See `classify::dominant_child_category`.
+    fn dominant(&self, index: u64) -> Option<Category> {
+        let mut dir = self.dir(index)?;
+        for _ in 0..3 {
+            let run = self.run(dir);
+            let mut subdirectories =
+                run.iter().filter(|item| item.kind == DIRECTORY);
+            if let Some(category) = subdirectories.clone().find_map(|item| {
+                category_of_name(self.name(item)).or_else(|| {
+                    self.is_git_store(item.value).then_some(Category::Git)
+                })
+            }) {
+                return Some(category);
+            }
+            dir = self.dir(subdirectories.next()?.value)?;
+        }
+        None
+    }
+
     /// The tree as nodes, the root named `name`.
     pub(super) fn tree(
         &self,
@@ -227,6 +295,7 @@ impl Flat {
                 return node;
             }
         };
+        let (category, reclaim) = decode((dir.category, dir.reclaim));
         let child = |item: &Item| {
             let name = self.name(item);
             if item.kind == DIRECTORY {
@@ -239,7 +308,34 @@ impl Flat {
                     stopped,
                 );
             }
-            leaf(item, name)
+            // A file beneath the root is what its name says; deeper, it
+            // is what holds it: see `classify::classify`.
+            let (category, reclaim) = if depth == 0 {
+                top_level_kind(name, false, || false, || None, |_| false)
+            } else {
+                (category, reclaim)
+            };
+            let kind = if item.kind == LINK {
+                NodeKind::Symlink
+            } else {
+                NodeKind::File
+            };
+            let files = u64::from(kind == NodeKind::File);
+            Node {
+                name: name.into(),
+                kind,
+                bytes: item.value,
+                own_bytes: item.value,
+                files,
+                own_files: files,
+                dirs: 0,
+                inode: item.shared.then_some((0, u64::from(item.record))),
+                read_error: false,
+                modified: item.modified,
+                category,
+                reclaim,
+                children: Vec::new(),
+            }
         };
         let run = self.run(dir);
         node.children.reserve_exact(run.len());
@@ -253,7 +349,84 @@ impl Flat {
             files: dir.files,
             dirs: dir.dirs,
             modified: dir.modified,
+            category,
+            reclaim,
             ..node
+        }
+    }
+
+    /// Decide what directories are, as `classify::classify` would, in a
+    /// tree whose kinds are all unset. The root's entries are decided
+    /// first: one takes the kind of its largest child.
+    pub(super) fn classify(&mut self) {
+        let Some(&root) = self.dirs.first() else {
+            return;
+        };
+        let run = self.run(root);
+        let mut kinds: Vec<(u64, Kind)> = run
+            .par_iter()
+            .filter(|item| item.kind == DIRECTORY)
+            .flat_map_iter(|item| {
+                let (category, reclaim) = top_level_kind(
+                    self.name(item),
+                    true,
+                    || self.is_git_store(item.value),
+                    || self.dominant(item.value),
+                    |wanted| self.has(run, wanted),
+                );
+                let mut kinds = Vec::new();
+                self.kinds(item.value, code(category, reclaim), 1, &mut kinds);
+                kinds
+            })
+            .collect();
+        kinds.push((0, code(Category::Other, None)));
+        for (index, (category, reclaim)) in kinds {
+            if let Some(dir) = usize::try_from(index)
+                .ok()
+                .and_then(|index| self.dirs.get_mut(index))
+            {
+                dir.category = category;
+                dir.reclaim = reclaim;
+            }
+        }
+    }
+
+    /// Directory `index` is of `kind` now: note it in `out` if that is new,
+    /// and go on beneath it if so.
+    fn kinds(
+        &self,
+        index: u64,
+        kind: Kind,
+        depth: usize,
+        out: &mut Vec<(u64, Kind)>,
+    ) {
+        let Some(dir) = self.dir(index) else {
+            return;
+        };
+        let changed = (dir.category, dir.reclaim) != kind;
+        if changed {
+            out.push((index, kind));
+        }
+        if !changed || depth >= MOST_LEVELS {
+            return;
+        }
+        let (category, reclaim) = decode(kind);
+        let run = self.run(dir);
+        let child = |item: &Item, out: &mut Vec<(u64, Kind)>| {
+            if item.kind != DIRECTORY {
+                return;
+            }
+            let (category, reclaim) = directory_kind(
+                self.name(item),
+                || self.is_git_store(item.value),
+                |wanted| self.has(run, wanted),
+                category,
+                reclaim,
+            );
+            self.kinds(item.value, code(category, reclaim), depth + 1, out);
+        };
+        for item in run {
+            child(item, out);
         }
     }
 }
@@ -421,17 +594,4 @@ impl Table<'_> {
             .extend(scratch.drain(start..).map(|(_, item)| item));
         Ok(index)
     }
-}
-
-/// A file's or link's node, settled.
-pub(super) fn leaf(item: &Item, name: &str) -> Node {
-    let kind = if item.kind == LINK {
-        NodeKind::Symlink
-    } else {
-        NodeKind::File
-    };
-    let mut node = Node::entry(name, kind, item.value);
-    node.modified = item.modified;
-    node.inode = item.shared.then_some((0, u64::from(item.record)));
-    node
 }
