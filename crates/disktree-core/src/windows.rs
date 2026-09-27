@@ -34,25 +34,35 @@ use windows_sys::Wdk::Storage::FileSystem::{
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL,
     ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED,
-    INVALID_HANDLE_VALUE, MAX_PATH, OBJ_CASE_INSENSITIVE,
-    RtlNtStatusToDosError, UNICODE_STRING,
+    GENERIC_ALL, GENERIC_WRITE, INVALID_HANDLE_VALUE, MAX_PATH,
+    OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
-use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorOwner, INHERIT_ONLY_ACE, IsValidAcl, IsWellKnownSid,
+    OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
-    FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FILE_WRITE_DATA, FileDispositionInfo,
+    CreateDirectoryW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_EXTD_DIR_INFO,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileDispositionInfo,
     FileIdExtdDirectoryInfo, FileIdType, FileStandardInfo, FindFirstVolumeW,
     FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
     GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
-    GetVolumePathNamesForVolumeNameW, OpenFileById, ReOpenFile, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    GetVolumePathNamesForVolumeNameW, OpenFileById, READ_CONTROL, ReOpenFile,
+    SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1023,8 +1033,26 @@ fn standard_sizes(file: &File) -> io::Result<(u64, u64)> {
 /// What an elevated process makes its caches with: owned by the
 /// Administrators group, under a protected ACL that grants Administrators
 /// and SYSTEM alone any access. No ordinary process of the user can then
-/// change what an elevated scan reads back.
+/// change what an elevated scan reads back and trusts.
 const CACHE_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)";
+
+/// Rights that change a file's bytes or attributes, or who may: granted to
+/// anyone but Administrators or SYSTEM, a cache is not trusted. On a
+/// directory the same bits add and delete its entries.
+const CACHE_WRITE_RIGHTS: u32 = GENERIC_ALL
+    | GENERIC_WRITE
+    | DELETE
+    | WRITE_DAC
+    | WRITE_OWNER
+    | FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_DELETE_CHILD
+    | FILE_WRITE_ATTRIBUTES;
+
+/// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE`.
+const ALLOWED_ACE: u8 = 0;
+const DENIED_ACE: u8 = 1;
 
 /// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `_POSIX_SEMANTICS`.
 const RENAME_REPLACE: u32 = 1;
@@ -1064,6 +1092,138 @@ fn descriptor_from_sddl(sddl: &str) -> io::Result<CacheSecurity> {
     Ok(CacheSecurity(descriptor))
 }
 
+/// Whether `sid` is the Administrators group or SYSTEM.
+fn admin_sid(sid: *mut core::ffi::c_void) -> bool {
+    // SAFETY: callers pass a SID returned by Win32 or one whose complete
+    // byte range was checked inside a validated ACL.
+    unsafe {
+        !sid.is_null()
+            && (IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                || IsWellKnownSid(sid, WinLocalSystemSid) != 0)
+    }
+}
+
+/// Whether `descriptor` holds only what Administrators and SYSTEM can
+/// change: owned by one of them, under a protected ACL, which inheritance
+/// cannot widen later, that grants no one else a right to write.
+fn trusted_descriptor(descriptor: *mut core::ffi::c_void) -> bool {
+    let mut owner = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut present = 0;
+    let mut control = 0;
+    let mut defaulted = 0;
+    let mut revision = 0;
+    // SAFETY: descriptor is a live security descriptor from Win32. Each
+    // output is a live local, and the returned pointers live with it.
+    let valid = unsafe {
+        GetSecurityDescriptorOwner(
+            descriptor,
+            &raw mut owner,
+            &raw mut defaulted,
+        ) != 0
+            && GetSecurityDescriptorDacl(
+                descriptor,
+                &raw mut present,
+                &raw mut dacl,
+                &raw mut defaulted,
+            ) != 0
+            && GetSecurityDescriptorControl(
+                descriptor,
+                &raw mut control,
+                &raw mut revision,
+            ) != 0
+    };
+    if !valid
+        || !admin_sid(owner)
+        || present == 0
+        || dacl.is_null()
+        || control & SE_DACL_PROTECTED == 0
+    {
+        return false;
+    }
+    // SAFETY: dacl points into the live descriptor; IsValidAcl verifies
+    // its size and ACE boundaries before GetAce is asked for any entry.
+    if unsafe { IsValidAcl(dacl) } == 0 {
+        return false;
+    }
+    // SAFETY: dacl is valid and still belongs to the live descriptor.
+    let count = unsafe { (*dacl).AceCount };
+    for index in 0..u32::from(count) {
+        let mut ace = std::ptr::null_mut();
+        // SAFETY: a validated ACL has count ACEs; GetAce checks the index
+        // and gives a pointer within the descriptor.
+        if unsafe { GetAce(dacl, index, &raw mut ace) } == 0 {
+            return false;
+        }
+        // SAFETY: GetAce gave a pointer to an ACE_HEADER within the ACL.
+        let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
+        // An inherit-only entry applies to what is made inside later, not
+        // to this; a denial only takes rights away.
+        if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
+            || header.AceType == DENIED_ACE
+        {
+            continue;
+        }
+        // Object, callback and other entries that allow: not understood
+        // here, so not trusted.
+        if header.AceType != ALLOWED_ACE {
+            return false;
+        }
+        // The mask, then the SID: revision, count and authority, then the
+        // count's sub-authorities, all within the entry.
+        let sid_at = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let size = usize::from(header.AceSize);
+        if size < sid_at + 8 {
+            return false;
+        }
+        let ace = ace.cast::<u8>();
+        // SAFETY: IsValidAcl checked that the entry's `size` bytes lie in
+        // the ACL, and the mask and the SID's first 8 bytes are within them.
+        let (mask, subs, sid) = unsafe {
+            (
+                ace.add(offset_of!(ACCESS_ALLOWED_ACE, Mask))
+                    .cast::<u32>()
+                    .read_unaligned(),
+                usize::from(*ace.add(sid_at + 1)),
+                ace.add(sid_at),
+            )
+        };
+        if mask & CACHE_WRITE_RIGHTS != 0
+            && (sid_at + 8 + 4 * subs > size || !admin_sid(sid.cast()))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn trusted_handle(file: &File) -> bool {
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: the handle is open with READ_CONTROL and the out parameter
+    // receives a LocalAlloc descriptor. The other outputs are unused.
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if result != 0 || descriptor.is_null() {
+        return false;
+    }
+    let owned = CacheSecurity(descriptor);
+    trusted_descriptor(owned.0)
+}
+
+fn untrusted() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "untrusted cache")
+}
+
 /// Where the cache `name` under `dir` is kept: `mft-<drive>.bin` for a
 /// file table read, `walk-<root>.bin` for a walk. An elevated process
 /// keeps its own apart, in `admin`, and never reads the ones the user's
@@ -1078,8 +1238,8 @@ pub fn cache_path(dir: &Path, name: &str) -> PathBuf {
 
 /// The directory `dir`, open, and for `create` made first. An elevated
 /// process makes it with the admin-only owner and ACL, and takes it only
-/// while it is a directory rather than a link to one. It holds it
-/// without share-delete, so no one moves it away meanwhile.
+/// while it is still that, and a directory rather than a link to one. It
+/// holds it without share-delete, so no one moves it away meanwhile.
 fn cache_directory(dir: &Path, create: bool, admin: bool) -> io::Result<File> {
     if !admin {
         if create {
@@ -1119,18 +1279,16 @@ fn cache_directory(dir: &Path, create: bool, admin: bool) -> io::Result<File> {
         }
     }
     let handle = OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(dir)?;
     let attributes = winapi_util::file::information(&handle)?.file_attributes();
     if attributes & u64::from(FILE_ATTRIBUTE_DIRECTORY) == 0
         || attributes & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !trusted_handle(&handle)
     {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "cache directory is a link",
-        ));
+        return Err(untrusted());
     }
     Ok(handle)
 }
@@ -1195,9 +1353,9 @@ fn open_in(
 }
 
 /// The cache at `path`, open for reading; `None` sends the scan back to a
-/// whole read. Opened through its directory's handle, and a link in its
-/// place is not followed. An elevated process reads only its own, in
-/// the admin directory.
+/// whole read. An elevated process reads only a file Administrators own
+/// and alone can change, in a directory the same holds for, and checks
+/// the very handle it then reads.
 pub fn cache_read(path: &Path) -> Option<File> {
     read_cache(path, elevated())
 }
@@ -1207,7 +1365,7 @@ fn read_cache(path: &Path, admin: bool) -> Option<File> {
     let file = open_in(
         &directory,
         path.file_name()?,
-        FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+        READ_CONTROL | FILE_READ_DATA | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN,
         None,
@@ -1216,7 +1374,9 @@ fn read_cache(path: &Path, admin: bool) -> Option<File> {
     let attributes = winapi_util::file::information(&file)
         .ok()?
         .file_attributes();
-    (attributes & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) == 0).then_some(file)
+    (attributes & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        && (!admin || trusted_handle(&file)))
+    .then_some(file)
 }
 
 /// Another handle on the file `original` has open, for reads at offsets of
@@ -1275,13 +1435,19 @@ fn write_cache(
     let mut file = open_in(
         &directory,
         &partial,
-        DELETE | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
+        DELETE | READ_CONTROL | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ,
         FILE_OVERWRITE_IF,
         security.as_ref(),
     )?;
-    let written =
-        write(&mut file).and_then(|()| rename_in(&directory, &file, name));
+    // A file system that keeps no owner or ACL leaves it untrusted, as
+    // does one left with another ACL; deleted below, it is made anew next
+    // time.
+    let written = if admin && !trusted_handle(&file) {
+        Err(untrusted())
+    } else {
+        write(&mut file).and_then(|()| rename_in(&directory, &file, name))
+    };
     if written.is_err() {
         let gone = FILE_DISPOSITION_INFO { DeleteFile: true };
         // SAFETY: the handle is open with DELETE access; `gone` is live for
@@ -1405,6 +1571,49 @@ pub fn make_junction(link: &Path, target: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn elevated_cache_refuses_untrusted_owner_and_write_grants() {
+        let trusted = cache_security().expect("admin descriptor");
+        assert!(trusted_descriptor(trusted.0));
+        for good in [
+            "O:SYG:SYD:P(A;;FA;;;SY)",
+            // Reading is anyone's; denials and entries only for what is
+            // made inside later take nothing from the admins' hold.
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;FR;;;BU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(D;;FA;;;BU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;OICIIO;GA;;;BU)",
+        ] {
+            let descriptor = descriptor_from_sddl(good).expect(good);
+            assert!(trusted_descriptor(descriptor.0), "{good}");
+        }
+        for bad in [
+            "O:BUG:BAD:P(A;;FA;;;BA)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;GW;;;BU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;GA;;;AU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;SD;;;BU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;WD;;;WD)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;CI;FA;;;BU)",
+            "O:BAG:BAD:(A;;FA;;;BA)",
+            "O:BAG:BA",
+        ] {
+            let descriptor = descriptor_from_sddl(bad).expect(bad);
+            assert!(!trusted_descriptor(descriptor.0), "{bad}");
+        }
+        // An ordinary file, owned by the user (or by Administrators when
+        // elevated) under the ACL it inherits: never trusted, yet a
+        // process that is not elevated reads it as its own.
+        let temp = TempDir::new().expect("tempdir");
+        let file = temp.path().join("user-owned.bin");
+        fs::write(&file, b"forged tree").expect("write");
+        let handle = OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .open(&file)
+            .expect("open");
+        assert!(!trusted_handle(&handle));
+        assert!(read_cache(&file, true).is_none());
+        assert!(read_cache(&file, false).is_some());
+    }
 
     #[test]
     fn a_failed_cache_write_leaves_the_last_one_and_nothing_beside_it() {
