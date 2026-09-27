@@ -19,9 +19,10 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use windows_sys::Win32::System::Ioctl::{
-    FSCTL_GET_NTFS_FILE_RECORD, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
+    FSCTL_GET_NTFS_FILE_RECORD, FSCTL_QUERY_USN_JOURNAL,
+    FSCTL_READ_USN_JOURNAL, USN_REASON_FILE_CREATE,
 };
 
 use super::flat::{Dir, Flat, Fresh, Item, NONE};
@@ -81,6 +82,13 @@ pub(super) fn query(volume: &File) -> Option<Journal> {
     })
 }
 
+/// What the journal says of a file since some point: whether any entry
+/// made it (a directory made since holds only what the journal names).
+#[derive(Clone, Copy, Default)]
+struct Change {
+    created: bool,
+}
+
 /// Every file the journal names from `from` on, and where it ended.
 /// `None` when the journal cannot be read from there: it has dropped those
 /// entries, or holds a kind this does not know.
@@ -88,8 +96,8 @@ fn changes(
     volume: &File,
     journal: Journal,
     from: u64,
-) -> Option<(FxHashSet<u32>, u64)> {
-    let mut files = FxHashSet::default();
+) -> Option<(FxHashMap<u32, Change>, u64)> {
+    let mut files = FxHashMap::default();
     let mut buffer = vec![0_u8; JOURNAL_BUFFER];
     let mut at_usn = from;
     loop {
@@ -107,13 +115,15 @@ fn changes(
         while at < out.len() {
             let length = u32_at(out, at)? as usize;
             // Version 2 records, which a version 0 request gets on NTFS:
-            // 64-bit file references at 8.
+            // 64-bit file references at 8, reasons at 40.
             if length < 60 || u16_at(out, at + 4)? != 2 {
                 return None;
             }
             let record = out.get(at..at + length)?;
             let number = u32::try_from(u64_at(record, 8)? & REFERENCE).ok()?;
-            files.insert(number);
+            let reason = u32_at(record, 40)?;
+            let change: &mut Change = files.entry(number).or_default();
+            change.created |= reason & USN_REASON_FILE_CREATE != 0;
             at += length;
         }
         if out.len() <= 8 || next <= at_usn {
@@ -135,10 +145,12 @@ pub(super) fn resume(
 ) -> Option<Flat> {
     let (mut flat, checkpoint) = load(file, geometry, journal, key(options))?;
     let (files, _) = changes(volume, journal, checkpoint.next)?;
-    let mut numbers: Vec<u32> = files.into_iter().collect();
+    let mut numbers: Vec<u32> = files.keys().copied().collect();
     numbers.sort_unstable();
     let fresh = fresh(&read_again(path, geometry, &numbers)?);
-    let touched = flat.patch(&numbers, &fresh, options)?;
+    let created =
+        |number| files.get(&number).is_some_and(|change| change.created);
+    let touched = flat.patch(&numbers, &fresh, created, options)?;
     flat.classify(&touched);
     Some(flat)
 }

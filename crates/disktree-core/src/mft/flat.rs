@@ -9,6 +9,13 @@
 //! above them, and decides kinds again only where a change can reach: a
 //! journal of a few thousand changes costs thousands of steps, not the
 //! millions a tree built from the table again would.
+//!
+//! A kept tree holds only what it shows, so a directory that comes into
+//! view with entries it never held (a cloud folder made local, a folder
+//! moved in from a hidden one) cannot be brought up to date from it: the
+//! table is read whole instead. One made since the tree was is fine, as
+//! every entry it has was made or moved in since too, and the journal
+//! names each.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,7 +36,7 @@ use crate::classify::{
 use crate::scan::{ScanOptions, ScanProgress};
 use crate::tree::{Metric, Node, NodeKind};
 
-/// No directory: the root's parent.
+/// No directory: the root's parent, and a directory dropped from the tree.
 pub(super) const NONE: u32 = u32::MAX;
 
 /// What an [`Item`] is.
@@ -37,7 +44,8 @@ pub(super) const FILE: u8 = 0;
 pub(super) const LINK: u8 = 1;
 pub(super) const DIRECTORY: u8 = 2;
 
-/// A kind not decided yet: every directory of a tree just built.
+/// A kind not decided yet: every directory of a tree just built, and one
+/// a change brought in.
 const UNSET: u8 = u8::MAX;
 
 /// A directory's [`Category`] and [`Reclaim`], by number: see [`code`].
@@ -53,7 +61,8 @@ pub(super) struct Dir {
     /// Its entries: `items[first..first + len]`, in the order shown.
     pub first: u32,
     pub len: u32,
-    /// The directory holding it; [`NONE`] for the root.
+    /// The directory holding it; [`NONE`] for the root and for one
+    /// dropped from the tree, whose `record` is [`NONE`] too.
     pub parent: u32,
     pub category: u8,
     pub reclaim: u8,
@@ -473,15 +482,18 @@ impl Flat {
     }
 
     /// Bring the tree up to date: `numbers` are the records that changed,
-    /// sorted, and `fresh` what those still in use hold now. Totals and order
-    /// come up to date too; kinds are left to [`Flat::classify`], given what
-    /// this returns: the directories whose entries changed and every one
-    /// above them. `None` when a change reaches a directory, which only a
-    /// whole read takes in yet, or the changes do not make a tree.
+    /// sorted, and `fresh` what those still in use hold now. `created`
+    /// tells a record made since the tree was. Totals and order come up to
+    /// date too; kinds are left to [`Flat::classify`], given what this
+    /// returns: the directories whose entries changed and every one above
+    /// them. `None` when the tree cannot be brought up to date from what
+    /// it holds: a directory came into view whose entries it never held,
+    /// a directory has two names, or the changes do not make a tree.
     pub(super) fn patch(
         &mut self,
         numbers: &[u32],
         fresh: &FxHashMap<u32, Fresh>,
+        created: impl Fn(u32) -> bool,
         options: &ScanOptions,
     ) -> Option<Vec<bool>> {
         // The root and the file system's own records are never entries.
@@ -490,11 +502,6 @@ impl Flat {
             .copied()
             .filter(|&number| number >= FIRST_USER_RECORD)
             .collect();
-        if numbers.iter().any(|number| {
-            fresh.get(number).is_some_and(|fresh| fresh.info.directory)
-        }) {
-            return None;
-        }
         let changed = Bits::of(&numbers);
         let parents: FxHashSet<u32> = numbers
             .iter()
@@ -517,7 +524,7 @@ impl Flat {
             .collect();
         let mut dir_of = FxHashMap::default();
         for (record, index) in found {
-            if changed.has(record) || dir_of.insert(record, index).is_some() {
+            if dir_of.insert(record, index).is_some() {
                 return None;
             }
         }
@@ -541,13 +548,49 @@ impl Flat {
             old.iter().map(|&(dir, _)| dir).collect();
         let removed: FxHashSet<u32> = old.iter().map(|&(_, at)| at).collect();
 
+        // A changed record that is a shown directory now keeps its place
+        // in `dirs` if it had one at the same sequence number, and gets a
+        // new one if it was made since the tree was.
+        let mut placed: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut unknown = FxHashSet::default();
+        for &number in &numbers {
+            let Some(Fresh { info, .. }) = fresh.get(&number) else {
+                continue;
+            };
+            if !info.in_use
+                || !info.directory
+                || is_link(info)
+                || info.attributes & EVICTED != 0
+            {
+                continue;
+            }
+            match dir_of.get(&number) {
+                Some(&index)
+                    if self.dirs[index as usize].sequence == info.sequence =>
+                {
+                    placed.insert(number, index);
+                }
+                _ if created(number) => {
+                    let index = u32::try_from(self.dirs.len()).ok()?;
+                    self.dirs.push(Dir::new(number, info.sequence));
+                    placed.insert(number, index);
+                    dirty.insert(index);
+                }
+                _ => {
+                    unknown.insert(number);
+                }
+            }
+        }
+
         // The entries changed records have now, as the build makes them.
         let mut added: FxHashMap<u32, Vec<Item>> = FxHashMap::default();
+        let mut attached = FxHashSet::default();
         for &number in &numbers {
             let Some(Fresh { info, names }) = fresh.get(&number) else {
                 continue;
             };
-            if !info.in_use {
+            let directory = info.directory && !is_link(info);
+            if !info.in_use || directory && info.attributes & EVICTED != 0 {
                 continue;
             }
             let mut charged = false;
@@ -555,39 +598,83 @@ impl Flat {
                 if *parent == number || hidden(options, name, info) {
                     continue;
                 }
-                let Some(&holder) = dir_of.get(parent) else {
+                let holder = if changed.has(*parent) {
+                    placed.get(parent)
+                } else {
+                    dir_of.get(parent)
+                };
+                let Some(&holder) = holder else {
                     continue;
                 };
                 if self.dirs[holder as usize].sequence != *parent_sequence {
                     continue;
                 }
-                let mut size = if options.apparent_size {
-                    info.apparent
-                } else {
-                    info.allocated
-                };
-                let shared = info.names > 1;
-                // One of a hardlinked file's names weighs, as the build
-                // charges the first it meets.
-                if options.dedup_hardlinks && shared && size > 0 {
-                    if charged {
-                        size = 0;
+                let mut item = if directory {
+                    let Some(&child) = placed.get(&number) else {
+                        if unknown.contains(&number) {
+                            return None;
+                        }
+                        continue;
+                    };
+                    if !attached.insert(child) {
+                        return None;
                     }
-                    charged = true;
-                }
-                let mut item = Item {
-                    record: number,
-                    sequence: info.sequence,
-                    kind: if is_link(info) { LINK } else { FILE },
-                    shared,
-                    value: size,
-                    modified: info.modified,
-                    ..Item::default()
+                    self.dirs[child as usize].parent = holder;
+                    Item {
+                        record: number,
+                        sequence: info.sequence,
+                        kind: DIRECTORY,
+                        value: u64::from(child),
+                        ..Item::default()
+                    }
+                } else {
+                    let mut size = if options.apparent_size {
+                        info.apparent
+                    } else {
+                        info.allocated
+                    };
+                    let shared = info.names > 1;
+                    // One of a hardlinked file's names weighs, as the
+                    // build charges the first it meets.
+                    if options.dedup_hardlinks && shared && size > 0 {
+                        if charged {
+                            size = 0;
+                        }
+                        charged = true;
+                    }
+                    Item {
+                        record: number,
+                        sequence: info.sequence,
+                        kind: if is_link(info) { LINK } else { FILE },
+                        shared,
+                        value: size,
+                        modified: info.modified,
+                        ..Item::default()
+                    }
                 };
                 name_into(&mut self.text, &mut item, name).ok()?;
                 added.entry(holder).or_default().push(item);
                 dirty.insert(holder);
             }
+        }
+
+        // A changed record's directory with no place now went, or left the
+        // view, with everything that stayed beneath it.
+        let gone: Vec<u32> = dir_of
+            .iter()
+            .filter(|&(&record, index)| {
+                changed.has(record) && !attached.contains(index)
+            })
+            .map(|(_, &index)| index)
+            .chain(
+                placed
+                    .values()
+                    .copied()
+                    .filter(|index| !attached.contains(index)),
+            )
+            .collect();
+        for index in gone {
+            self.drop_beneath(index, &removed);
         }
 
         // Each changed directory's entries again, as a run of their own
@@ -614,6 +701,20 @@ impl Flat {
             let dir = &mut self.dirs[index as usize];
             dir.first = first;
             dir.len = len;
+        }
+
+        // Every directory given a place must hang from the root.
+        for &index in &attached {
+            let mut at = index;
+            let mut steps = 0;
+            while at != 0 {
+                let dir = self.dirs.get(at as usize)?;
+                if !dir.is_live() || steps > MOST_LEVELS {
+                    return None;
+                }
+                at = dir.parent;
+                steps += 1;
+            }
         }
 
         // Totals and order again for each changed directory and those
@@ -649,6 +750,36 @@ impl Flat {
             self.settle(index, options.metric);
         }
         Some(touched)
+    }
+
+    /// Drop directory `index` and everything beneath it that stayed
+    /// there: an entry in `removed` has another place now, or none.
+    fn drop_beneath(&mut self, index: u32, removed: &FxHashSet<u32>) {
+        let mut stack = vec![index];
+        while let Some(index) = stack.pop() {
+            let Some(dir) = self.dirs.get_mut(index as usize) else {
+                continue;
+            };
+            if !dir.is_live() {
+                continue;
+            }
+            let (first, len) = (dir.first, dir.len);
+            *dir = Dir {
+                record: NONE,
+                parent: NONE,
+                len: 0,
+                ..*dir
+            };
+            for at in first..first.saturating_add(len) {
+                if let Some(item) = self.items.get(at as usize)
+                    && item.kind == DIRECTORY
+                    && !removed.contains(&at)
+                    && let Ok(child) = u32::try_from(item.value)
+                {
+                    stack.push(child);
+                }
+            }
+        }
     }
 
     /// Total directory `index` from its entries, and order them.
@@ -931,6 +1062,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+    use crate::classify::{Category, Reclaim};
     use crate::tree::Seen;
 
     /// A volume: what each record in use holds, the root's (5, at
@@ -1021,8 +1153,10 @@ mod tests {
         assert!(flat.is_valid());
         flat
     }
+
     /// `flat`, the tree of `before`, brought up to `after` the way a
-    /// resumed scan does: the journal names what differs.
+    /// resumed scan does: the journal names what differs, and records made
+    /// since, new or reused, are what it saw created.
     fn patch(
         flat: &mut Flat,
         before: &Volume,
@@ -1041,7 +1175,14 @@ mod tests {
             .iter()
             .filter_map(|&number| Some((number, after.get(&number)?.clone())))
             .collect();
-        let touched = flat.patch(&numbers, &fresh, options)?;
+        let created = |number: u32| {
+            after.get(&number).is_some_and(|now| {
+                before
+                    .get(&number)
+                    .is_none_or(|was| was.info.sequence != now.info.sequence)
+            })
+        };
+        let touched = flat.patch(&numbers, &fresh, created, options)?;
         flat.classify(&touched);
         Some(())
     }
@@ -1092,6 +1233,91 @@ mod tests {
     }
 
     #[test]
+    fn patching_the_changed_files_gives_what_a_whole_read_would() {
+        let root = (ROOT, 5);
+        let mut before = Volume::new();
+        for (number, fresh) in [
+            (20, dir(1, root, "src")),
+            (21, dir(1, (20, 1), "rust-thing")),
+            (22, dir(1, (21, 1), "target")),
+            (23, file(1, &[(22, 1, "out.bin")], 5000)),
+            (24, dir(1, root, "repo")),
+            (25, dir(1, (24, 1), "objects")),
+            (26, dir(1, (24, 1), "refs")),
+            (27, dir(1, root, "mystery")),
+            (60, dir(1, (27, 1), "src")),
+            (61, file(1, &[(60, 1, "small")], 100)),
+            (30, dir(1, (27, 1), ".cache")),
+            (31, file(1, &[(30, 1, "blob")], 5000)),
+            (40, file(1, &[(5, 5, "notes.txt")], 300)),
+            (
+                41,
+                file(1, &[(20, 1, "linked.bin"), (27, 1, "linked.bin")], 7000),
+            ),
+            (42, file(1, &[(20, 1, "gone.txt")], 10)),
+            (43, dir(1, (20, 1), "old")),
+            (44, file(1, &[(43, 1, "x")], 20)),
+            (45, dir(1, (24, 1), "moving")),
+            (46, file(1, &[(45, 1, "m")], 999)),
+        ] {
+            before.insert(number, fresh);
+        }
+        let mut after = before.clone();
+        // A file grows past its folder's neighbours; a manifest makes
+        // `target` build output; `HEAD` makes `repo` a git store; `src`
+        // outgrows `.cache`, so `mystery` is code now.
+        after.insert(23, file(1, &[(22, 1, "out.bin")], 50_000));
+        after.insert(50, file(1, &[(21, 1, "Cargo.toml")], 1));
+        after.insert(51, file(1, &[(24, 1, "HEAD")], 1));
+        after.insert(61, file(1, &[(60, 1, "small")], 90_000));
+        // Gone, renamed, moved with what it holds, one name fewer.
+        after.remove(&43);
+        after.remove(&44);
+        after.insert(40, file(1, &[(5, 5, "notes.md")], 300));
+        after.insert(45, dir(1, (20, 1), "moving"));
+        after.insert(41, file(1, &[(20, 1, "linked.bin")], 7000));
+        // Made since: a folder with a file, and a record reused.
+        after.insert(52, dir(1, (20, 1), "fresh"));
+        after.insert(53, file(1, &[(52, 1, "f")], 64));
+        after.insert(42, dir(2, root, "reborn"));
+        after.insert(54, file(1, &[(42, 2, "inside")], 4097));
+
+        for options in [
+            exact(),
+            ScanOptions {
+                metric: Metric::Files,
+                apparent_size: true,
+                ..exact()
+            },
+        ] {
+            let mut flat = built(&before, &options);
+            patch(&mut flat, &before, &after, &options).expect("patched");
+            let expected = built(&after, &options);
+            assert_eq!(lines(&flat), lines(&expected));
+            assert!(flat.is_valid());
+        }
+        let tree = |flat: &Flat| {
+            flat.tree("C:".into(), &ScanProgress::default())
+                .unwrap_or_else(|_| panic!("a tree"))
+        };
+        let expected = tree(&built(&after, &exact()));
+        let named = |node: &Node, path: &[&str]| {
+            let mut node = node.clone();
+            for part in path {
+                node = node.child_named(part).expect("there").clone();
+            }
+            node
+        };
+        assert_eq!(
+            named(&expected, &["src", "rust-thing", "target", "out.bin"])
+                .reclaim,
+            Some(Reclaim::BuildOutput)
+        );
+        assert_eq!(named(&expected, &["repo", "refs"]).category, Category::Git);
+        assert_eq!(named(&expected, &["mystery"]).category, Category::Code);
+    }
+
+    #[test]
     fn hardlinks_counted_once_stay_counted_once_through_a_patch() {
         let root = (ROOT, 5);
         let before: Volume = [
@@ -1114,45 +1340,236 @@ mod tests {
     }
 
     #[test]
-    fn patching_changed_files_gives_what_a_whole_read_would() {
+    fn a_folder_coming_into_view_with_unknown_entries_needs_a_whole_read() {
         let root = (ROOT, 5);
-        let before: Volume = [
-            (20, dir(1, root, "src")),
-            (21, dir(1, (20, 1), "rust-thing")),
-            (22, file(1, &[(21, 1, "out.bin")], 5000)),
-            (23, file(1, &[(20, 1, "gone.txt")], 10)),
-            (24, file(1, &[(5, 5, "notes.txt")], 300)),
-            (25, file(1, &[(21, 1, "moving")], 999)),
-            (26, file(1, &[(20, 1, "linked"), (21, 1, "linked")], 7000)),
-        ]
-        .into_iter()
-        .collect();
-        let mut after = before.clone();
-        // Grown, gone, renamed, moved, one name fewer, and made since: a
-        // manifest that makes `rust-thing` code with build output.
-        after.insert(22, file(1, &[(21, 1, "out.bin")], 90_000));
-        after.remove(&23);
-        after.insert(24, file(1, &[(5, 5, "notes.md")], 300));
-        after.insert(25, file(1, &[(20, 1, "moving")], 999));
-        after.insert(26, file(1, &[(20, 1, "linked")], 7000));
-        after.insert(27, file(1, &[(21, 1, "Cargo.toml")], 1));
-        for options in [
-            exact(),
-            ScanOptions {
-                metric: Metric::Files,
-                apparent_size: true,
-                ..exact()
-            },
-        ] {
+        let options = ScanOptions {
+            include_hidden: false,
+            ..exact()
+        };
+        for attributes in [EVICTED, FILE_ATTRIBUTE_HIDDEN] {
+            let mut away = dir(1, root, "cloud");
+            away.info.attributes = attributes;
+            let before: Volume = [
+                (20, away),
+                (21, file(1, &[(20, 1, "held")], 100)),
+                (22, dir(1, (20, 1), "inner")),
+                (23, file(1, &[(22, 1, "deep")], 100)),
+            ]
+            .into_iter()
+            .collect();
+            // Made local, or shown: its entries were never in the tree.
+            let mut shown = before.clone();
+            shown.insert(20, dir(1, root, "cloud"));
             let mut flat = built(&before, &options);
-            patch(&mut flat, &before, &after, &options).expect("patched");
-            assert_eq!(lines(&flat), lines(&built(&after, &options)));
-            assert!(flat.is_valid());
+            assert!(patch(&mut flat, &before, &shown, &options).is_none());
+            // Nor were those of a folder moved out of it.
+            let mut moved = before.clone();
+            moved.insert(22, dir(1, root, "inner"));
+            let mut flat = built(&before, &options);
+            assert!(patch(&mut flat, &before, &moved, &options).is_none());
+            // One made since holds only what the journal names.
+            let mut made = shown.clone();
+            made.insert(20, dir(2, root, "cloud"));
+            made.remove(&21);
+            made.remove(&22);
+            made.remove(&23);
+            made.insert(24, file(1, &[(20, 2, "new")], 5));
+            let mut flat = built(&before, &options);
+            patch(&mut flat, &before, &made, &options).expect("patched");
+            assert_eq!(lines(&flat), lines(&built(&made, &options)));
         }
-        // A directory changed is for a whole read.
-        let mut moved = before.clone();
-        moved.insert(21, dir(1, root, "rust-thing"));
-        let mut flat = built(&before, &exact());
-        assert!(patch(&mut flat, &before, &moved, &exact()).is_none());
+    }
+
+    /// A small xorshift: the same volumes on every run.
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, count: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % count.max(1) as u64) as usize
+        }
+    }
+
+    /// Names the kinds depend on, and some that mean nothing.
+    const NAMES: [&str; 20] = [
+        "a",
+        "b",
+        "src",
+        "target",
+        "Cargo.toml",
+        "objects",
+        "refs",
+        "HEAD",
+        ".cache",
+        "node_modules",
+        "package.json",
+        "logs",
+        "Application Support",
+        ".microsandbox",
+        "snapshots",
+        "layers",
+        "x.bin",
+        "y.txt",
+        "Downloads",
+        ".git",
+    ];
+
+    /// Directories of `volume`: `(record, sequence)`, the root first.
+    fn directories(volume: &Volume) -> Vec<(u32, u16)> {
+        std::iter::once((ROOT, 5))
+            .chain(
+                volume
+                    .iter()
+                    .filter(|(_, fresh)| fresh.info.directory)
+                    .map(|(&number, fresh)| (number, fresh.info.sequence)),
+            )
+            .collect()
+    }
+
+    /// Whether `number` is `within` or beneath it.
+    fn beneath(volume: &Volume, mut number: u32, within: u32) -> bool {
+        for _ in 0..64 {
+            if number == within {
+                return true;
+            }
+            match volume.get(&number) {
+                Some(fresh) if fresh.info.directory => {
+                    number = fresh.names[0].0;
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// A name `parent` does not hold yet.
+    fn free_name(
+        volume: &Volume,
+        parent: u32,
+        random: &mut Random,
+    ) -> Option<String> {
+        let taken = |name: &str| {
+            volume.values().any(|fresh| {
+                fresh
+                    .names
+                    .iter()
+                    .any(|(p, _, n)| *p == parent && n == name)
+            })
+        };
+        let name = NAMES[random.below(NAMES.len())];
+        (!taken(name)).then(|| name.to_owned())
+    }
+
+    /// One change as a volume sees them: a file resized, something
+    /// renamed, moved, deleted or made, a name linked or unlinked, a
+    /// record reused.
+    fn change(volume: &mut Volume, random: &mut Random, next: &mut u32) {
+        let numbers: Vec<u32> = volume.keys().copied().collect();
+        let dirs = directories(volume);
+        let pick = numbers.get(random.below(numbers.len())).copied();
+        let (parent, parent_sequence) = dirs[random.below(dirs.len())];
+        let Some(name) = free_name(volume, parent, random) else {
+            return;
+        };
+        let size = [0, 1, 4096, 5000, 70_000, 1 << 30][random.below(6)];
+        match (random.below(9), pick) {
+            (0, Some(number)) if !volume[&number].info.directory => {
+                let fresh = volume.get_mut(&number).expect("there");
+                fresh.info.apparent = size;
+                fresh.info.allocated = size.next_multiple_of(4096);
+            }
+            (1 | 2, Some(number)) if !beneath(volume, parent, number) => {
+                let fresh = volume.get_mut(&number).expect("there");
+                fresh.names[0] = (parent, parent_sequence, name);
+            }
+            (3, Some(number)) => {
+                // A folder goes with everything in it; a file with another
+                // name elsewhere keeps that one.
+                let gone: BTreeSet<u32> = volume
+                    .iter()
+                    .filter(|(_, fresh)| fresh.info.directory)
+                    .map(|(&other, _)| other)
+                    .filter(|&other| beneath(volume, other, number))
+                    .chain([number])
+                    .collect();
+                volume.retain(|other, fresh| {
+                    if gone.contains(other) {
+                        return false;
+                    }
+                    fresh.names.retain(|(parent, ..)| !gone.contains(parent));
+                    fresh.info.names = fresh.names.len() as u8;
+                    !fresh.names.is_empty()
+                });
+            }
+            (4, _) => {
+                volume.insert(
+                    *next,
+                    file(1, &[(parent, parent_sequence, &name)], size),
+                );
+                *next += 1;
+            }
+            (5, _) => {
+                volume.insert(*next, dir(1, (parent, parent_sequence), &name));
+                *next += 1;
+            }
+            (6, Some(number)) if !volume[&number].info.directory => {
+                let fresh = volume.get_mut(&number).expect("there");
+                fresh.names.push((parent, parent_sequence, name));
+                fresh.info.names += 1;
+            }
+            (7, Some(number)) if volume[&number].names.len() > 1 => {
+                let fresh = volume.get_mut(&number).expect("there");
+                fresh.names.pop();
+                fresh.info.names -= 1;
+            }
+            (8, Some(number)) if !volume[&number].info.directory => {
+                let sequence = volume[&number].info.sequence + 1;
+                let fresh = if random.below(2) == 0 {
+                    dir(sequence, (parent, parent_sequence), &name)
+                } else {
+                    file(sequence, &[(parent, parent_sequence, &name)], size)
+                };
+                volume.insert(number, fresh);
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn a_chain_of_patched_changes_keeps_what_a_whole_read_would_make() {
+        for (seed, options) in [
+            (0x2545_F491_4F6C_DD1D, exact()),
+            (
+                0x9E37_79B9_7F4A_7C15,
+                ScanOptions {
+                    metric: Metric::Files,
+                    ..exact()
+                },
+            ),
+        ] {
+            let mut random = Random(seed);
+            let mut volume = Volume::new();
+            let mut next = 20;
+            for _ in 0..40 {
+                change(&mut volume, &mut random, &mut next);
+            }
+            let mut flat = built(&volume, &options);
+            for round in 0..300 {
+                let before = volume.clone();
+                for _ in 0..=random.below(4) {
+                    change(&mut volume, &mut random, &mut next);
+                }
+                patch(&mut flat, &before, &volume, &options)
+                    .unwrap_or_else(|| panic!("round {round} patched"));
+                assert_eq!(
+                    lines(&flat),
+                    lines(&built(&volume, &options)),
+                    "round {round}"
+                );
+                assert!(flat.is_valid());
+            }
+        }
     }
 }
