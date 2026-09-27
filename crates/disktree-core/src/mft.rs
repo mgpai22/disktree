@@ -27,15 +27,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_NO_BUFFERING, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_NO_BUFFERING, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
 use crate::scan::{ScanOptions, ScanProgress};
-use crate::tree::{Node, NodeKind, Seen, settle_directory, settle_leaf};
+use crate::tree::{Node, PARALLEL_LEVELS, Seen, settle_directory};
 use crate::windows::{Aligned, drive_letter};
+
+mod flat;
 
 /// Most bytes read per call: large enough that the disk streams, small
 /// enough that many reads are outstanding at once.
@@ -214,7 +215,10 @@ pub fn scan(
         progress,
         seen: options.dedup_hardlinks.then(Seen::new),
     };
-    let tree = table.directory(ROOT, crate::scan::file_name(root), 0);
+    let tree = table.nodes().map(|mut node| {
+        node.name = crate::scan::file_name(root);
+        node
+    });
     // Hundreds of megabytes, whose freeing the caller would otherwise
     // wait out before it can finish the tree.
     let Table {
@@ -1053,34 +1057,45 @@ impl Table<'_> {
         }
     }
 
-    /// Mirrors what the walk keeps: see `WalkContext::classify`.
+    /// The tree beneath the root as nodes, totalled and ordered but not
+    /// classified. What each entry becomes is `flat`'s.
+    fn nodes(&self) -> Result<Node, Stop> {
+        let sequence = self
+            .infos
+            .get(ROOT as usize)
+            .map_or(0, |info| info.sequence);
+        self.directory(ROOT, sequence, Box::default(), 0)
+    }
+
     fn directory(
         &self,
         number: u32,
+        sequence: u16,
         name: Box<str>,
         depth: usize,
     ) -> Result<Node, Stop> {
         if depth >= MOST_LEVELS || self.progress.is_cancelled() {
             return Err(Stop);
         }
-        let descend = self.options.max_depth.is_none_or(|max| depth < max);
-        let sequence =
-            self.infos.get(number as usize).map(|info| info.sequence);
+        let descend = self.descend(depth);
         let child = |entry: &Entry| {
-            // A root directory holds hundreds of thousands of files; a
-            // check per entry lets a cancel stop within one.
-            if self.progress.is_cancelled() {
-                return Some(Err(Stop));
-            }
-            // An entry naming a parent whose record has since been reused.
-            if Some(entry.parent_sequence) != sequence {
-                return None;
-            }
-            self.child(entry, depth, descend).transpose()
+            Some(match self.entry(entry, sequence, descend).transpose()? {
+                Err(stop) => Err(stop),
+                Ok(flat::Built::File(item)) => {
+                    Ok(flat::leaf(&item, self.name(entry)))
+                }
+                Ok(flat::Built::Directory(child, child_sequence)) => self
+                    .directory(
+                        child,
+                        child_sequence,
+                        self.name(entry).into(),
+                        depth + 1,
+                    ),
+            })
         };
         let entries = self.entries(number);
         // See `tree::PARALLEL_LEVELS`: parallel only near the top.
-        let children = if depth < crate::tree::PARALLEL_LEVELS {
+        let children = if depth < PARALLEL_LEVELS {
             entries
                 .par_iter()
                 .filter_map(child)
@@ -1098,59 +1113,6 @@ impl Table<'_> {
         node.children = children;
         settle_directory(&mut node, self.options.metric);
         Ok(node)
-    }
-
-    /// The node for `entry`; `None` for one the walk would not list.
-    fn child(
-        &self,
-        entry: &Entry,
-        depth: usize,
-        descend: bool,
-    ) -> Result<Option<Node>, Stop> {
-        // The root is its own parent.
-        if entry.child == entry.parent || entry.child < FIRST_USER_RECORD {
-            return Ok(None);
-        }
-        let Some(info) = self.infos.get(entry.child as usize) else {
-            return Ok(None);
-        };
-        if !info.in_use {
-            return Ok(None);
-        }
-        let name = self.name(entry);
-        if !self.options.include_hidden
-            && (name.starts_with('.')
-                || info.attributes & FILE_ATTRIBUTE_HIDDEN != 0)
-        {
-            return Ok(None);
-        }
-        let link = info.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            && info.reparse_tag & NAME_SURROGATE != 0;
-        if info.directory && !link {
-            if info.attributes & EVICTED != 0 || !descend {
-                return Ok(None);
-            }
-            return self
-                .directory(entry.child, name.into(), depth + 1)
-                .map(Some);
-        }
-        let size = if self.options.apparent_size {
-            info.apparent
-        } else {
-            info.allocated
-        };
-        let kind = if link {
-            NodeKind::Symlink
-        } else {
-            NodeKind::File
-        };
-        let mut node = Node::entry(name, kind, size);
-        node.modified = info.modified;
-        if info.names > 1 {
-            node.inode = Some((0, u64::from(entry.child)));
-        }
-        settle_leaf(&mut node, self.seen.as_ref());
-        Ok(Some(node))
     }
 }
 
@@ -1186,7 +1148,17 @@ fn signed(bytes: &[u8]) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
     use super::*;
+    use crate::tree::NodeKind;
+
+    /// The tree a table makes, the way a scan makes it.
+    fn tree_of(table: &Table<'_>) -> Result<Node, Stop> {
+        let mut node = table.nodes()?;
+        crate::classify::classify(&mut node);
+        Ok(node)
+    }
 
     const RECORD: usize = 1024;
     const USA_AT: usize = 0x30;
@@ -1667,11 +1639,7 @@ mod tests {
                 max_depth,
                 ..ScanOptions::default()
             };
-            let Ok(root) = table(&rows, &options, &progress).directory(
-                ROOT,
-                "C:\\".into(),
-                0,
-            ) else {
+            let Ok(root) = tree_of(&table(&rows, &options, &progress)) else {
                 panic!("the table is not cut short");
             };
             let mut found = Vec::new();
@@ -1711,7 +1679,7 @@ mod tests {
         let options = ScanOptions::default();
         let progress = ScanProgress::default();
         let table = table(&rows, &options, &progress);
-        assert!(table.directory(ROOT, "C:\\".into(), 0).is_err());
+        assert!(tree_of(&table).is_err());
         assert!(!progress.is_cancelled());
     }
 }
