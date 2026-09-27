@@ -852,7 +852,7 @@ mod tests {
         names.sort_by_key(|entry| entry.parent);
         let starts = super::super::starts(&names, infos.len());
         Table {
-            infos,
+            infos: infos.into(),
             names,
             texts: vec![text],
             starts,

@@ -115,6 +115,92 @@ struct Info {
     names: u8,
 }
 
+/// Empty stretches of the MFT need no record storage. A page lookup
+/// keeps access constant-time without a pointer allocation per record.
+#[derive(Default)]
+struct RecordTable {
+    pages: Vec<usize>,
+    values: Vec<Info>,
+    len: usize,
+}
+
+impl RecordTable {
+    const PAGE: usize = 256;
+    const EMPTY: usize = usize::MAX;
+
+    fn offset(pages: &[usize], number: usize) -> Option<usize> {
+        let &page = pages.get(number / Self::PAGE)?;
+        (page != Self::EMPTY).then(|| page + number % Self::PAGE)
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    fn get(&self, number: usize) -> Option<&Info> {
+        if number >= self.len {
+            return None;
+        }
+        self.values.get(Self::offset(&self.pages, number)?)
+    }
+
+    fn get_mut(&mut self, number: usize) -> Option<&mut Info> {
+        if number >= self.len {
+            return None;
+        }
+        let at = Self::offset(&self.pages, number)?;
+        self.values.get_mut(at)
+    }
+
+    /// Allocate all new pages together before a journal patch writes any
+    /// records, so growth copies the existing values at most once.
+    fn reserve(
+        &mut self,
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+    ) {
+        let mut count = self.values.len();
+        for range in ranges {
+            self.len = self.len.max(range.end);
+            self.pages
+                .resize(self.len.div_ceil(Self::PAGE), Self::EMPTY);
+            for page in &mut self.pages
+                [range.start / Self::PAGE..range.end.div_ceil(Self::PAGE)]
+            {
+                if *page == Self::EMPTY {
+                    *page = count;
+                    count += Self::PAGE;
+                }
+            }
+        }
+        let added = count - self.values.len();
+        self.values.reserve_exact(added);
+        self.values
+            .par_extend(rayon::iter::repeat_n(Info::default(), added));
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<Info>> for RecordTable {
+    fn from(values: Vec<Info>) -> Self {
+        let mut table = Self::default();
+        table.reserve(values.chunks(Self::PAGE).enumerate().filter_map(
+            |(page, values)| {
+                values
+                    .iter()
+                    .any(|info| info.in_use)
+                    .then_some(page * Self::PAGE..(page + 1) * Self::PAGE)
+            },
+        ));
+        table.len = values.len();
+        for (number, info) in values.into_iter().enumerate() {
+            if let Some(slot) = table.get_mut(number) {
+                *slot = info;
+            }
+        }
+        table
+    }
+}
+
 /// One name of a file: an entry in its parent directory. The name itself
 /// is `len` bytes at `at` in its chunk's text: millions of names in a few
 /// strings, not millions of allocations made only to be copied again.
@@ -336,7 +422,7 @@ fn read_whole(
 
 /// Whether the root's record reads as an in-use directory; if not, the
 /// table is not what this expects and the walk measures instead.
-fn is_root_directory(infos: &[Info]) -> bool {
+fn is_root_directory(infos: &RecordTable) -> bool {
     infos
         .get(ROOT as usize)
         .is_some_and(|root| root.in_use && root.directory)
@@ -644,21 +730,14 @@ fn decode_runs(attribute: &[u8], cluster: u64) -> Option<Runs> {
     }
 }
 
-/// A slot per record up to the last one read, each empty until a read
-/// fills it: records no read covers are free.
-fn table(reads: &[(u64, u64, u64)], record: usize) -> Vec<Info> {
-    table_of(reads.last().map_or(0, |&(_, size, first)| {
-        usize::try_from(first + size / record as u64).unwrap_or(0)
-    }))
-}
-
-/// `len` empty slots, made in parallel: millions of them.
-fn table_of(len: usize) -> Vec<Info> {
-    let mut infos = Vec::new();
-    (0..len)
-        .into_par_iter()
-        .map(|_| Info::default())
-        .collect_into_vec(&mut infos);
+/// Only pages touched by a read need slots. Reads are ordered by record,
+/// so each read remains one contiguous stretch of the compact values.
+fn table(reads: &[(u64, u64, u64)], record: usize) -> RecordTable {
+    let mut infos = RecordTable::default();
+    infos.reserve(reads.iter().map(|&(_, size, first)| {
+        let first = usize::try_from(first).unwrap_or(0);
+        first..first + usize::try_from(size).unwrap_or(0) / record
+    }));
     infos
 }
 
@@ -680,17 +759,19 @@ fn read_records(
     path: &str,
     record: usize,
     reads: &[(u64, u64, u64)],
-    infos: &mut [Info],
+    infos: &mut RecordTable,
     apparent_size: bool,
     progress: &ScanProgress,
 ) -> Option<Vec<Parsed>> {
     let threads = rayon::current_num_threads().max(1);
     // `plan_reads` gives them in record order, none overlapping.
     let mut stretches = Vec::with_capacity(reads.len());
-    let mut rest = infos;
+    let mut rest = infos.values.as_mut_slice();
     let mut done = 0;
     for &(_, size, first) in reads {
-        let skip = usize::try_from(first).ok()?.checked_sub(done)?;
+        let first =
+            RecordTable::offset(&infos.pages, usize::try_from(first).ok()?)?;
+        let skip = first.checked_sub(done)?;
         let count = usize::try_from(size).ok()? / record;
         let (stretch, tail) =
             rest.get_mut(skip..)?.split_at_mut_checked(count)?;
@@ -1074,7 +1155,10 @@ fn attributes(record: &[u8]) -> impl Iterator<Item = Attribute<'_>> {
 
 /// Every chunk's names in one list, and what extension records add to
 /// their base records' slots in `infos`.
-fn merge(parsed: Vec<Parsed>, infos: &mut [Info]) -> (Vec<Entry>, Vec<String>) {
+fn merge(
+    parsed: Vec<Parsed>,
+    infos: &mut RecordTable,
+) -> (Vec<Entry>, Vec<String>) {
     // Copied in parallel, a chunk per task, into a list filled first: one
     // thread appending millions of names made every other one wait. Room
     // for the names from extension records too, pushed after: any system
@@ -1141,7 +1225,7 @@ struct Stop;
 /// What a whole read of the table found, ready for `flat` to build the
 /// tree from.
 struct Table<'a> {
-    infos: Vec<Info>,
+    infos: RecordTable,
     /// Sorted by parent; `starts[p]..starts[p + 1]` are `p`'s entries.
     names: Vec<Entry>,
     texts: Vec<String>,
@@ -1384,6 +1468,7 @@ mod tests {
         parse_record(&mut base, 0x5A, 0, &mut out, &mut infos[0x5A]);
         parse_record(&mut stale, 300, 0, &mut out, &mut infos[300]);
         parse_record(&mut fresh, 301, 0, &mut out, &mut infos[301]);
+        let mut infos = infos.into();
 
         let (names, texts) = merge(vec![out], &mut infos);
         let mut listed: Vec<&str> = names
@@ -1396,7 +1481,7 @@ mod tests {
         listed.sort_unstable();
         assert_eq!(listed, ["current", "second"]);
         // Nor is the stale name counted as a link.
-        assert_eq!(infos[0x5A].names, 2);
+        assert_eq!(infos.get(0x5A).expect("base record").names, 2);
     }
 
     /// A file of `size` bytes named `names`, at sequence `sequence`.
@@ -1413,13 +1498,19 @@ mod tests {
 
     /// Every record read the way a whole read of the table does.
     fn read_all(records: &[(u32, Vec<u8>)]) -> State {
-        let mut infos = vec![Info::default(); 64];
+        let len = records
+            .iter()
+            .map(|(number, _)| *number as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut infos = vec![Info::default(); len];
         let mut out = Parsed::default();
         for (number, bytes) in records {
             let mut bytes = bytes.clone();
             let slot = &mut infos[*number as usize];
             parse_record(&mut bytes, *number, 0, &mut out, slot);
         }
+        let mut infos = infos.into();
         let (mut names, texts) = merge(vec![out], &mut infos);
         names.sort_by_key(|entry| entry.parent);
         State {
@@ -1438,7 +1529,7 @@ mod tests {
                 let at = entry.at as usize;
                 let text = &state.texts[entry.chunk as usize]
                     [at..at + usize::from(entry.len)];
-                let info = state.infos[entry.child as usize];
+                let info = state.infos.get(entry.child as usize).expect("file");
                 (entry.parent, entry.child, text.to_owned(), info.apparent)
             })
             .collect();
@@ -1461,19 +1552,19 @@ mod tests {
             (33, file(1, &[(5, "gone.txt")], 300)),
             (40, file(1, &[(30, "kept.txt")], 400)),
         ];
-        // 31 is renamed and grows, 32 loses a link, 33 is deleted and 34
-        // made; 40 is untouched.
+        // 31 is renamed and grows, 32 loses a link, 33 is deleted and
+        // a record in a previously absent page is made; 40 is untouched.
         let after = [
             (30, dir(2)),
             (31, file(1, &[(30, "a2.txt")], 150)),
             (32, file(1, &[(30, "b.txt")], 200)),
-            (34, file(1, &[(30, "new.txt")], 50)),
+            (1024, file(1, &[(30, "new.txt")], 50)),
             (40, file(1, &[(30, "kept.txt")], 400)),
         ];
         let mut state = read_all(&before);
         // Re-read as NTFS hands records over, update sequence undone, in
         // two lists as two threads would.
-        let changed = [31, 32, 33, 34];
+        let changed = [31, 32, 33, 1024];
         let lists = changed
             .chunks(2)
             .enumerate()
@@ -1505,22 +1596,26 @@ mod tests {
 
         assert_eq!(listing(&state), listing(&read_all(&after)));
         assert!(state.names.is_sorted_by_key(|entry| entry.parent));
-        assert!(!state.infos[33].in_use);
-        assert_eq!(state.infos[32].names, 1, "no longer a hardlink");
+        assert!(!state.infos.get(33).is_some_and(|info| info.in_use));
+        assert_eq!(
+            state.infos.get(32).expect("file").names,
+            1,
+            "no longer a hardlink"
+        );
     }
 
     #[test]
     fn a_root_that_is_not_an_in_use_directory_is_refused() {
         let mut infos = vec![Info::default(); 8];
-        assert!(!is_root_directory(&infos));
+        assert!(!is_root_directory(&infos.clone().into()));
         infos[ROOT as usize] = Info {
             in_use: true,
             ..Info::default()
         };
-        assert!(!is_root_directory(&infos));
+        assert!(!is_root_directory(&infos.clone().into()));
         infos[ROOT as usize].directory = true;
-        assert!(is_root_directory(&infos));
-        assert!(!is_root_directory(&infos[..3]));
+        assert!(is_root_directory(&infos.clone().into()));
+        assert!(!is_root_directory(&infos[..3].to_vec().into()));
     }
 
     #[test]
@@ -1585,14 +1680,13 @@ mod tests {
 
     #[test]
     fn each_read_parses_into_the_slots_of_its_own_records() {
-        // Records 0..96, each named for its number and sized 100 more,
-        // in an ordinary file: reading it is reading a table, but for the
-        // volume. Reads of 4 records, every third one skipped, handed out
-        // to 3 threads, so no thread's reads are adjacent.
+        // Reads cross page boundaries and leave missing pages between
+        // them. Adjacent reads share a page, but never a record.
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("records");
         let mut bytes = Vec::new();
         for number in 0..96_u64 {
+            let number = (number / 8) * 512 + 254 + number % 8;
             bytes.extend(record(
                 IN_USE,
                 0,
@@ -1605,7 +1699,9 @@ mod tests {
         std::fs::write(&path, bytes).expect("records written");
         let reads: Vec<_> = (0..24_u64)
             .filter(|read| read % 3 != 1)
-            .map(|read| (read * 4096, 4096, read * 4))
+            .map(|read| {
+                (read * 4096, 4096, (read / 2) * 512 + 254 + (read % 2) * 4)
+            })
             .collect();
         let mut infos = super::table(&reads, RECORD);
         let progress = ScanProgress::default();
@@ -1627,8 +1723,13 @@ mod tests {
             .expect("the file reads");
         let (names, texts) = merge(parsed, &mut infos);
 
-        for (number, info) in infos.iter().enumerate() {
-            let read = number / 4 % 3 != 1;
+        for number in 0..infos.len() {
+            let info = infos.get(number).copied().unwrap_or_default();
+            let relative = number.checked_sub(254);
+            let read = relative.is_some_and(|relative| {
+                relative % 512 < 8
+                    && ((relative / 512) * 2 + relative % 512 / 4) % 3 != 1
+            });
             assert_eq!(info.in_use, read, "record {number}");
             if read {
                 assert_eq!(info.apparent, number as u64 + 100);
@@ -1732,7 +1833,7 @@ mod tests {
         names.sort_by_key(|entry| entry.parent);
         let starts = starts(&names, infos.len());
         Table {
-            infos,
+            infos: infos.into(),
             names,
             texts: vec![text],
             starts,

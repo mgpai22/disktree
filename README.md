@@ -317,6 +317,9 @@ The same program, with Windows' answers to the questions above:
   `-l`, whose links the table does not follow. disktree flushes the volume
   after its own removals so the rescan shows them; changes other programs
   made seconds before may not show yet.
+  During that read, record facts use 256-record pages: stretches skipped
+  as free have no record storage. File record numbers stay unchanged, so
+  journal updates still find their records directly.
   The finished tree that read made is kept under
   `%LOCALAPPDATA%\disktree\admin` (about 280 MB for that drive),
   and the next launch or rescan starts from it: NTFS's change journal

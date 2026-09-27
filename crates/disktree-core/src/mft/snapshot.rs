@@ -40,8 +40,8 @@ use windows_sys::Win32::System::Ioctl::{
 use super::flat::Fresh;
 use super::{
     ATTRIBUTE_LIST, Entry, Geometry, Info, Parsed, REFERENCE, ReadExact as _,
-    attributes, contents, merge, open_volume, parse_fixed, u16_at, u32_at,
-    u64_at,
+    RecordTable, attributes, contents, merge, open_volume, parse_fixed, u16_at,
+    u32_at, u64_at,
 };
 use crate::scan::ScanOptions;
 use crate::tree::{Dir, Item, Metric, NONE, Seg, Tree};
@@ -115,7 +115,7 @@ pub(super) struct Checkpoint {
 
 /// What one read of the table found, as `merge` leaves it.
 pub(super) struct State {
-    pub infos: Vec<Info>,
+    pub infos: RecordTable,
     pub names: Vec<Entry>,
     pub texts: Vec<String>,
 }
@@ -493,18 +493,20 @@ pub(super) fn apply(
         names,
         texts,
     } = state;
-    let last = numbers.iter().copied().max().unwrap_or(0);
-    let len = infos.len().max(last as usize + 1);
-    infos.resize(len, Info::default());
-    let mut changed = vec![false; len];
+    infos.reserve(
+        numbers
+            .iter()
+            .map(|&number| number as usize..number as usize + 1),
+    );
+    let mut changed = vec![false; infos.len()];
     for &number in numbers {
         changed[number as usize] = true;
-        infos[number as usize] = Info::default();
+        *infos.get_mut(number as usize)? = Info::default();
     }
     let mut parsed = Vec::with_capacity(lists.len());
     for (bases, out) in lists {
         for (number, info) in bases {
-            infos[number as usize] = info;
+            *infos.get_mut(number as usize)? = info;
         }
         parsed.push(out);
     }
