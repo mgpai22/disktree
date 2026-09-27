@@ -337,7 +337,8 @@ The same program, with Windows' answers to the questions above:
   last whole read.
   An NTFS folder walk keeps a separate `walk-*.bin` tree snapshot:
   directly under `%LOCALAPPDATA%\disktree` without admin rights,
-  or in its `admin` subdirectory when elevated. The next launch reads
+  or in its `admin` subdirectory when elevated, written on a thread of
+  its own once the tree is shown. The next launch reads
   the unprivileged change journal, lists changed directories and all
   cached hardlink aliases, and updates only the changed ancestor totals.
   New or moved-in directories are walked. Corrupt caches, changed root or

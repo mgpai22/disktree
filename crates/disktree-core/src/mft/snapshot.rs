@@ -25,8 +25,7 @@
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -632,17 +631,6 @@ fn fetch(
     }
 }
 
-/// A kept tree being written, which a scan waits for before it reads one.
-static SAVING: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
-
-/// Wait until the last scan's tree is on disk.
-pub fn wait_for_saved() {
-    let saving = crate::scan::lock(&SAVING).take();
-    if let Some(saving) = saving {
-        let _ = saving.join();
-    }
-}
-
 /// Write the tree `make` gives for the next scan, on a thread of its own,
 /// then let go of it: making it and writing it are work the caller need
 /// not wait out.
@@ -656,23 +644,11 @@ pub(super) fn save_later(
     let serial = geometry.serial;
     let record = geometry.record;
     let key = key(options);
-    let spawned = std::thread::Builder::new().spawn(move || {
-        let work = || {
-            if let Some(tree) = make() {
-                let _ = save(&file, serial, record, key, &tree, &checkpoint);
-            }
-        };
-        // On this thread alone: nobody waits on it, and the parallel steps
-        // in making and writing the tree only woke the whole global pool
-        // to spin, which cost a cold scan up to a second of CPU.
-        match rayon::ThreadPoolBuilder::new().num_threads(1).build() {
-            Ok(alone) => alone.install(work),
-            Err(_) => work(),
+    crate::scan::save_later(move || {
+        if let Some(tree) = make() {
+            let _ = save(&file, serial, record, key, &tree, &checkpoint);
         }
     });
-    if let Ok(handle) = spawned {
-        *crate::scan::lock(&SAVING) = Some(handle);
-    }
 }
 
 /// The options a kept tree was made with, which a scan resuming from it

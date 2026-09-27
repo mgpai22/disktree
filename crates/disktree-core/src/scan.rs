@@ -240,9 +240,13 @@ impl ScanHandle {
     }
 }
 
-/// Wait for a background MFT snapshot write. The file-table reader can
-/// save after handing over the tree; folder walk snapshots finish before
-/// the scan returns. See [`ScanOptions::cache`].
+/// A kept tree being written, which a scan waits for before it reads one.
+#[cfg(windows)]
+static SAVING: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
+
+/// Wait until the last scan's kept tree is on disk: a scan hands its tree
+/// over first and keeps it for the next on a thread of its own. See
+/// [`ScanOptions::cache`].
 #[cfg_attr(
     not(windows),
     allow(
@@ -253,7 +257,40 @@ impl ScanHandle {
 )]
 pub fn wait_for_cache() {
     #[cfg(windows)]
-    crate::mft::wait_for_saved();
+    {
+        let saving = lock(&SAVING).take();
+        if let Some(saving) = saving {
+            let _ = saving.join();
+        }
+    }
+}
+
+/// Keep a tree for the next scan with `work`, on a thread of its own once
+/// any save before it is done: the scan hands its tree over without
+/// waiting out the write, and two writes never overlap.
+#[cfg(windows)]
+pub(crate) fn save_later(work: impl FnOnce() + Send + 'static) {
+    let mut saving = lock(&SAVING);
+    let previous = saving.take();
+    let spawned =
+        thread::Builder::new()
+            .name("disktree-save".into())
+            .spawn(move || {
+                if let Some(previous) = previous {
+                    let _ = previous.join();
+                }
+                // On this thread alone: nobody waits on it, and the parallel
+                // steps in making and writing a tree only woke the whole
+                // global pool to spin, which cost a cold scan up to a second
+                // of CPU.
+                match rayon::ThreadPoolBuilder::new().num_threads(1).build() {
+                    Ok(alone) => alone.install(work),
+                    Err(_) => work(),
+                }
+            });
+    if let Ok(handle) = spawned {
+        *saving = Some(handle);
+    }
 }
 
 /// Walk `root` and return the finished tree. Blocking.
@@ -1000,13 +1037,12 @@ fn scan_blocking(
     // On the walk's pool: the UI's own work on the global pool must not
     // queue behind a scan finishing.
     WALK_POOL.install(|| crate::classify::classify(&mut tree));
+    let tree = Arc::new(tree);
     #[cfg(windows)]
-    let tree = if let Some(cache) = cache {
-        cache.save(tree, context)
-    } else {
-        tree
-    };
-    Ok(Arc::new(tree))
+    if let Some(cache) = cache {
+        cache.save(&tree, context);
+    }
+    Ok(tree)
 }
 
 /// The walk's workers, and the file table reader's. Listing directories

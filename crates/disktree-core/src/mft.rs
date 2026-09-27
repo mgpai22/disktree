@@ -45,7 +45,6 @@ use crate::windows::{Aligned, drive_letter};
 mod flat;
 mod snapshot;
 
-pub use snapshot::wait_for_saved;
 use snapshot::{Checkpoint, Journal, State};
 
 /// Most bytes read per call: large enough that the disk streams, small
@@ -316,7 +315,7 @@ pub fn scan(
     let letter = drive_letter(canonical)?;
     let path = format!(r"\\.\{letter}:");
     // Its file must not change under the read of it next.
-    wait_for_saved();
+    crate::scan::wait_for_cache();
     let volume = open_volume(&path).ok()?;
     let geometry = geometry(&volume)?;
     // A depth limit leaves out directories a later change can bring into

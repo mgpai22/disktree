@@ -12,6 +12,7 @@
 use std::hash::Hasher as _;
 use std::io::{self, Read, Seek as _, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use rustc_hash::FxHasher;
 
@@ -63,7 +64,8 @@ pub(super) struct State {
     pub created: u64,
     pub options: u64,
     pub open: Vec<u64>,
-    pub tree: Tree,
+    /// Shared with the scan that handed it over: kept without a copy.
+    pub tree: Arc<Tree>,
 }
 
 /// The state kept in `path`, if it is whole and of this format.
@@ -605,7 +607,7 @@ fn decode(input: impl Read, len: usize) -> Option<State> {
         created,
         options,
         open,
-        tree,
+        tree: Arc::new(tree),
     })
 }
 
@@ -707,7 +709,7 @@ mod tests {
             created: 1_790_000_000,
             options: 0b101,
             open: vec![1, u64::MAX, 3],
-            tree,
+            tree: Arc::new(tree),
         }
     }
 

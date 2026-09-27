@@ -11,6 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::{Hash as _, Hasher as _};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -113,6 +114,8 @@ impl Checkpoint {
     }
 
     pub(super) fn resume(&self, context: &WalkContext) -> Option<Tree> {
+        // The last scan's tree may still be on its way to this file.
+        crate::scan::wait_for_cache();
         let started = Instant::now();
         let mut state = store::load(&self.file)?;
         if state.root != self.root.to_str()?
@@ -144,7 +147,8 @@ impl Checkpoint {
         if changed.len() > MAX_CHANGES {
             return None;
         }
-        let tree = &mut state.tree;
+        // Just loaded, so nothing else shares it.
+        let tree = Arc::get_mut(&mut state.tree)?;
         // What is listed again goes into a segment of its own, after the
         // one the tree loaded into: nothing already there moves.
         let seg = u32::try_from(tree.segs.len()).ok()?;
@@ -201,31 +205,42 @@ impl Checkpoint {
                 current,
             );
         }
-        Some(state.tree)
+        Arc::into_inner(state.tree)
     }
 
-    pub(super) fn save(self, tree: Tree, context: &WalkContext) -> Tree {
-        if context.cancelled() || !cacheable(&tree, self.volume) {
-            trace("cold unavailable: cancelled or unsupported tree entry");
-            return tree;
+    /// Keep `tree` for the next scan, on a thread of its own: the scan
+    /// hands it over meanwhile. A cancelled walk keeps nothing.
+    pub(super) fn save(self, tree: &Arc<Tree>, context: &WalkContext) {
+        if context.cancelled() {
+            trace("cold unavailable: cancelled");
+            return;
+        }
+        let tree = Arc::clone(tree);
+        crate::scan::save_later(move || self.write(tree));
+    }
+
+    fn write(self, tree: Arc<Tree>) {
+        if !cacheable(&tree, self.volume) {
+            trace("cold unavailable: unsupported tree entry");
+            return;
         }
         let Some(after) = query(&self.handle) else {
             trace("cold unavailable: journal query failed");
-            return tree;
+            return;
         };
         if !after.covers(self.journal.id, self.journal.next) {
             trace("cold unavailable: journal wrapped during walk");
-            return tree;
+            return;
         }
         // Only the walk's starting cursor must remain covered; expiry of
         // older history does not lose a change made during this walk. Seed
         // known writers from the history retained now, not an expired start.
         let Some(changes) = changes(&self.handle, after, after.first) else {
             trace("cold unavailable: retained journal unreadable or too large");
-            return tree;
+            return;
         };
         let Some(root) = self.root.to_str() else {
-            return tree;
+            return;
         };
         let state = store::State {
             root: root.to_owned(),
@@ -249,7 +264,6 @@ impl Checkpoint {
                 state.open.len()
             );
         }
-        state.tree
     }
 }
 
@@ -931,7 +945,7 @@ mod tests {
             created: 1_000,
             options: 0,
             open: Vec::new(),
-            tree: Tree::default(),
+            tree: Arc::default(),
         };
         let journal = Journal {
             id: 3,
