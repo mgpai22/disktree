@@ -25,7 +25,7 @@
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,19 +37,19 @@ use windows_sys::Win32::System::Ioctl::{
     FSCTL_READ_USN_JOURNAL, USN_REASON_CLOSE, USN_REASON_FILE_CREATE,
 };
 
-use super::flat::{Dir, Flat, Fresh, Item, NONE};
+use super::flat::Fresh;
 use super::{
     ATTRIBUTE_LIST, Entry, Geometry, Info, Parsed, REFERENCE, ReadExact as _,
     attributes, contents, merge, open_volume, parse_fixed, u16_at, u32_at,
     u64_at,
 };
 use crate::scan::ScanOptions;
-use crate::tree::Metric;
+use crate::tree::{Dir, Item, Metric, NONE, Seg, Tree};
 use crate::windows::{control, sizes_by_id};
 
 /// Bumped whenever what a kept tree holds changes, so one kept by an
 /// older build is read again rather than trusted.
-const MAGIC: [u8; 8] = *b"dttree\x00\x02";
+const MAGIC: [u8; 8] = *b"dttree\x00\x03";
 
 /// Changed files past which reading them one by one costs more than
 /// reading the whole table: 64,000 took 1 s from NTFS with their records
@@ -251,7 +251,7 @@ pub(super) fn resume(
     journal: Journal,
     file: &Path,
     options: &ScanOptions,
-) -> Option<(Flat, Option<Checkpoint>)> {
+) -> Option<(Tree, Option<Checkpoint>)> {
     let kept = open(file, geometry, journal, key(options))?;
     let checkpoint = &kept.checkpoint;
     // The tree comes off its file while the journal is read and the files
@@ -279,7 +279,7 @@ pub(super) fn resume(
     let created =
         |number| files.get(&number).is_some_and(|change| change.created);
     let touched = flat.patch(&numbers, &fresh, created, options)?;
-    flat.classify(&touched);
+    crate::classify::classify_where(&mut flat, Some(&touched));
     if next.saturating_sub(checkpoint.next) < RESAVE_JOURNAL
         && numbers.len() < RESAVE_FILES
     {
@@ -641,15 +641,15 @@ pub fn wait_for_saved() {
     }
 }
 
-/// Write the tree `make` makes for the next scan, on a thread of its own,
-/// then free it: making it and writing it are work the caller need not
-/// wait out, and hundreds of megabytes to free.
+/// Write the tree `make` gives for the next scan, on a thread of its own,
+/// then let go of it: making it and writing it are work the caller need
+/// not wait out.
 pub(super) fn save_later(
     file: PathBuf,
     geometry: &Geometry,
     options: &ScanOptions,
     checkpoint: Checkpoint,
-    make: impl FnOnce() -> Option<Flat> + Send + 'static,
+    make: impl FnOnce() -> Option<Arc<Tree>> + Send + 'static,
 ) {
     let serial = geometry.serial;
     let record = geometry.record;
@@ -686,8 +686,8 @@ fn key(options: &ScanOptions) -> u64 {
 /// whole, the options, and the counts of directories, entries, name bytes,
 /// open, revisit and big files, then the checksum of all that follows.
 const HEADER: usize = 8 * 14;
-const DIR: usize = 52;
-const ITEM: usize = 30;
+const DIR: usize = 46;
+const ITEM: usize = 28;
 const NUMBER: usize = 4;
 const BIG: usize = 16;
 
@@ -717,58 +717,61 @@ fn decode_big(bytes: &[u8]) -> (u32, u16, u64) {
     )
 }
 
-fn encode_dir(dir: &Dir, out: &mut [u8]) {
-    out[0..4].copy_from_slice(&dir.record.to_le_bytes());
-    out[4..6].copy_from_slice(&dir.sequence.to_le_bytes());
-    out[6..10].copy_from_slice(&dir.first.to_le_bytes());
-    out[10..14].copy_from_slice(&dir.len.to_le_bytes());
-    out[14..18].copy_from_slice(&dir.parent.to_le_bytes());
-    out[18] = dir.category;
-    out[19] = dir.reclaim;
-    out[20..28].copy_from_slice(&dir.bytes.to_le_bytes());
-    out[28..36].copy_from_slice(&dir.files.to_le_bytes());
-    out[36..44].copy_from_slice(&dir.dirs.to_le_bytes());
-    out[44..52].copy_from_slice(&dir.modified.to_le_bytes());
+/// A directory as a kept tree holds it: its runs are one list there, so
+/// `first` counts from the list's start, `base` being where its
+/// segment's runs begin.
+fn encode_dir(dir: &Dir, base: u32, out: &mut [u8]) {
+    out[0..8].copy_from_slice(&dir.id.to_le_bytes());
+    out[8..12].copy_from_slice(&dir.first.saturating_add(base).to_le_bytes());
+    out[12..16].copy_from_slice(&dir.len.to_le_bytes());
+    out[16..20].copy_from_slice(&dir.parent.to_le_bytes());
+    out[20] = dir.category;
+    out[21] = dir.reclaim;
+    out[22..30].copy_from_slice(&dir.bytes.to_le_bytes());
+    out[30..38].copy_from_slice(&dir.files.to_le_bytes());
+    out[38..42].copy_from_slice(&dir.dirs.to_le_bytes());
+    out[42..46].copy_from_slice(&dir.modified.to_le_bytes());
 }
 
 fn decode_dir(bytes: &[u8]) -> Dir {
     Dir {
-        record: u32_at(bytes, 0).unwrap_or(NONE),
-        sequence: u16_at(bytes, 4).unwrap_or(0),
-        first: u32_at(bytes, 6).unwrap_or(0),
-        len: u32_at(bytes, 10).unwrap_or(0),
-        parent: u32_at(bytes, 14).unwrap_or(NONE),
-        category: bytes.get(18).copied().unwrap_or(0),
-        reclaim: bytes.get(19).copied().unwrap_or(0),
-        bytes: u64_at(bytes, 20).unwrap_or(0),
-        files: u64_at(bytes, 28).unwrap_or(0),
-        dirs: u64_at(bytes, 36).unwrap_or(0),
-        modified: u64_at(bytes, 44).unwrap_or(0).cast_signed(),
+        id: u64_at(bytes, 0).unwrap_or(u64::MAX),
+        first: u32_at(bytes, 8).unwrap_or(0),
+        len: u32_at(bytes, 12).unwrap_or(0),
+        parent: u32_at(bytes, 16).unwrap_or(NONE),
+        category: bytes.get(20).copied().unwrap_or(0),
+        reclaim: bytes.get(21).copied().unwrap_or(0),
+        bytes: u64_at(bytes, 22).unwrap_or(0),
+        files: u64_at(bytes, 30).unwrap_or(0),
+        dirs: u32_at(bytes, 38).unwrap_or(0),
+        modified: u32_at(bytes, 42).unwrap_or(0),
+        ..Dir::EMPTY
     }
 }
 
-fn encode_item(item: &Item, out: &mut [u8]) {
-    out[0..4].copy_from_slice(&item.record.to_le_bytes());
-    out[4..6].copy_from_slice(&item.sequence.to_le_bytes());
-    out[6..10].copy_from_slice(&item.at.to_le_bytes());
-    out[10..12].copy_from_slice(&item.len.to_le_bytes());
-    out[12] = item.kind;
-    out[13] = u8::from(item.shared);
-    out[14..22].copy_from_slice(&item.value.to_le_bytes());
-    out[22..30].copy_from_slice(&item.modified.to_le_bytes());
+/// An entry as a kept tree holds it: its name's place counts from the
+/// start of all names, `base` being where its segment's begin.
+fn encode_item(item: &Item, base: u32, out: &mut [u8]) {
+    out[0..8].copy_from_slice(&item.id.to_le_bytes());
+    out[8..12].copy_from_slice(&item.at.saturating_add(base).to_le_bytes());
+    out[12..14].copy_from_slice(&item.len.to_le_bytes());
+    out[14] = item.kind;
+    out[15] = item.flags;
+    out[16..24].copy_from_slice(&item.value.to_le_bytes());
+    out[24..28].copy_from_slice(&item.modified.to_le_bytes());
 }
 
 fn decode_item(bytes: &[u8]) -> Item {
     Item {
-        record: u32_at(bytes, 0).unwrap_or(0),
-        sequence: u16_at(bytes, 4).unwrap_or(0),
-        at: u32_at(bytes, 6).unwrap_or(0),
-        len: u16_at(bytes, 10).unwrap_or(0),
+        id: u64_at(bytes, 0).unwrap_or(0),
+        at: u32_at(bytes, 8).unwrap_or(0),
+        len: u16_at(bytes, 12).unwrap_or(0),
         // Not a kind: a tree that holds it is refused.
-        kind: bytes.get(12).copied().unwrap_or(u8::MAX),
-        shared: bytes.get(13).is_some_and(|&shared| shared != 0),
-        value: u64_at(bytes, 14).unwrap_or(0),
-        modified: u64_at(bytes, 22).unwrap_or(0).cast_signed(),
+        kind: bytes.get(14).copied().unwrap_or(u8::MAX),
+        flags: bytes.get(15).copied().unwrap_or(0),
+        value: u64_at(bytes, 16).unwrap_or(0),
+        modified: u32_at(bytes, 24).unwrap_or(0),
+        volume: 0,
     }
 }
 
@@ -777,7 +780,7 @@ fn save(
     serial: u64,
     record: usize,
     key: u64,
-    tree: &Flat,
+    tree: &Tree,
     checkpoint: &Checkpoint,
 ) -> io::Result<()> {
     // Written whole under another name, then renamed over the old one: a
@@ -787,13 +790,70 @@ fn save(
     })
 }
 
-/// The tree, and where the next scan resumes from, into `out`.
+/// Records written a piece at a time, each piece's checksum as a region
+/// read back whole would have it: see [`read_region`].
+struct Pieces<'a> {
+    out: &'a mut File,
+    piece: Vec<u8>,
+    /// Bytes a piece holds.
+    full: usize,
+    region: u64,
+    index: usize,
+    sum: u64,
+}
+
+impl<'a> Pieces<'a> {
+    fn new(out: &'a mut File, region: u64, size: usize) -> Self {
+        let full = PIECE / size * size;
+        Self {
+            out,
+            piece: Vec::with_capacity(full),
+            full,
+            region,
+            index: 0,
+            sum: 0,
+        }
+    }
+
+    /// Add `bytes`, which must not cross a record's end.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut bytes = bytes;
+        while !bytes.is_empty() {
+            let room = self.full - self.piece.len();
+            let (now, later) = bytes.split_at(room.min(bytes.len()));
+            self.piece.extend_from_slice(now);
+            bytes = later;
+            if self.piece.len() == self.full {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sum ^= checksum(self.region, self.index, &self.piece);
+        self.out.write_all(&self.piece)?;
+        self.index += 1;
+        self.piece.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<u64> {
+        if !self.piece.is_empty() {
+            self.flush()?;
+        }
+        Ok(self.sum)
+    }
+}
+
+/// The tree, and where the next scan resumes from, into `out`: its
+/// segments one after the other, as one list of entries and one of names.
 fn write_tree(
     out: &mut File,
     serial: u64,
     record: usize,
     key: u64,
-    tree: &Flat,
+    tree: &Tree,
     checkpoint: &Checkpoint,
 ) -> io::Result<()> {
     let big = tree.largest(BIG_FILES);
@@ -803,26 +863,50 @@ fn write_tree(
         .chain(&checkpoint.revisit)
         .copied()
         .collect();
+    // Where each segment's entries and names begin in the lists written.
+    let mut bases = Vec::with_capacity(tree.segs.len());
+    let (mut items, mut text) = (0_usize, 0_usize);
+    for seg in &tree.segs {
+        bases.push((items, text));
+        items += seg.items.len();
+        text += seg.text.len();
+    }
+    if [items, text].iter().any(|&count| count > u32::MAX as usize) {
+        return Err(io::Error::other("too large to keep"));
+    }
+    let base = |seg: u32| bases.get(seg as usize).copied().unwrap_or((0, 0));
     // Its whole length first: grown a piece at a time, the file cost the
     // file system an extension per megabyte.
     let length = HEADER
         + tree.dirs.len() * DIR
-        + tree.items.len() * ITEM
-        + tree.text.len()
+        + items * ITEM
+        + text
         + numbers.len() * NUMBER
         + big.len() * BIG;
     out.set_len(length as u64)?;
     // The header goes in last, once the checksum is known.
     out.write_all(&[0; HEADER])?;
-    let mut piece = Vec::with_capacity(PIECE);
-    let mut sum =
-        write_region(out, &tree.dirs, DIR, DIRS, encode_dir, &mut piece)?;
-    sum ^=
-        write_region(out, &tree.items, ITEM, ITEMS, encode_item, &mut piece)?;
-    for (index, part) in tree.text.chunks(PIECE).enumerate() {
-        sum ^= checksum(TEXT, index, part);
-        out.write_all(part)?;
+    let mut record_bytes = [0_u8; DIR];
+    let mut pieces = Pieces::new(out, DIRS, DIR);
+    for dir in &tree.dirs {
+        encode_dir(dir, base(dir.seg).0 as u32, &mut record_bytes);
+        pieces.write(&record_bytes)?;
     }
+    let mut sum = pieces.finish()?;
+    let mut pieces = Pieces::new(out, ITEMS, ITEM);
+    for (seg, &(_, text)) in tree.segs.iter().zip(&bases) {
+        for item in &seg.items {
+            encode_item(item, text as u32, &mut record_bytes[..ITEM]);
+            pieces.write(&record_bytes[..ITEM])?;
+        }
+    }
+    sum ^= pieces.finish()?;
+    let mut pieces = Pieces::new(out, TEXT, 1);
+    for seg in &tree.segs {
+        pieces.write(seg.text.as_bytes())?;
+    }
+    sum ^= pieces.finish()?;
+    let mut piece = Vec::with_capacity(PIECE);
     sum ^= write_region(
         out,
         &numbers,
@@ -842,8 +926,8 @@ fn write_tree(
         checkpoint.whole.cast_unsigned(),
         key,
         tree.dirs.len() as u64,
-        tree.items.len() as u64,
-        tree.text.len() as u64,
+        items as u64,
+        text as u64,
         checkpoint.open.len() as u64,
         checkpoint.revisit.len() as u64,
         big.len() as u64,
@@ -887,10 +971,10 @@ fn load(
     geometry: &Geometry,
     journal: Journal,
     key: u64,
-) -> Option<(Flat, Checkpoint)> {
+) -> Option<(Tree, Checkpoint)> {
     let kept = open(file, geometry, journal, key)?;
-    let flat = body(&kept)?;
-    Some((flat, kept.checkpoint))
+    let tree = body(&kept)?;
+    Some((tree, kept.checkpoint))
 }
 
 /// A kept tree's header and lists of files, read and checked before its
@@ -959,12 +1043,11 @@ fn open(
     }
     let at = HEADER + body;
     let (numbers, sum) =
-        read_region(&input, at, numbers, NUMBER, NUMBERS, 0, |bytes| {
+        read_region(&input, at, numbers, NUMBER, NUMBERS, |bytes| {
             u32_at(bytes, 0).unwrap_or(0)
         })?;
     let at = at + numbers.len() * NUMBER;
-    let (big, big_sum) =
-        read_region(&input, at, big, BIG, BIGS, 0, decode_big)?;
+    let (big, big_sum) = read_region(&input, at, big, BIG, BIGS, decode_big)?;
     let (open, revisit) = numbers.split_at(open);
     Some(Kept {
         input,
@@ -984,34 +1067,18 @@ fn open(
     })
 }
 
-/// The tree itself, if it matches its checksum and is a tree.
-fn body(kept: &Kept) -> Option<Flat> {
+/// The tree itself, if it matches its checksum and is a tree: one
+/// segment, as the file holds it.
+fn body(kept: &Kept) -> Option<Tree> {
     let mut at = HEADER;
-    // Room to grow: a patch appends, and growing a list of millions past
-    // its capacity copies it whole.
-    let (dirs, mut found) = read_region(
-        &kept.input,
-        at,
-        kept.dirs,
-        DIR,
-        DIRS,
-        kept.dirs / 32,
-        decode_dir,
-    )?;
+    let (dirs, mut found) =
+        read_region(&kept.input, at, kept.dirs, DIR, DIRS, decode_dir)?;
     at += kept.dirs * DIR;
-    let (items, sum) = read_region(
-        &kept.input,
-        at,
-        kept.items,
-        ITEM,
-        ITEMS,
-        kept.items / 32,
-        decode_item,
-    )?;
+    let (items, sum) =
+        read_region(&kept.input, at, kept.items, ITEM, ITEMS, decode_item)?;
     found ^= sum;
     at += kept.items * ITEM;
-    let mut text = Vec::with_capacity(kept.text + kept.text / 32);
-    text.resize(kept.text, 0);
+    let mut text = vec![0; kept.text];
     found ^= text
         .par_chunks_mut(PIECE)
         .enumerate()
@@ -1026,8 +1093,16 @@ fn body(kept: &Kept) -> Option<Flat> {
         .collect::<Option<Vec<u64>>>()?
         .into_iter()
         .fold(kept.numbers, |sum, piece| sum ^ piece);
-    let flat = Flat { dirs, items, text };
-    (found == kept.sum && flat.is_valid()).then_some(flat)
+    let tree = Tree {
+        name: Box::default(),
+        dirs,
+        segs: vec![Seg {
+            items,
+            text: String::from_utf8(text).ok()?,
+        }],
+        volumes: vec![0],
+    };
+    (found == kept.sum && tree.is_valid()).then_some(tree)
 }
 
 /// `count` records of `size` bytes at `offset` in `file`, read a piece at
@@ -1040,11 +1115,10 @@ fn read_region<T: Clone + Default + Send + Sync>(
     count: usize,
     size: usize,
     region: u64,
-    spare: usize,
     decode: impl Fn(&[u8]) -> T + Sync + Send,
 ) -> Option<(Vec<T>, u64)> {
     let per = PIECE / size;
-    let mut records = Vec::with_capacity(count + spare);
+    let mut records = Vec::with_capacity(count);
     records.par_extend(rayon::iter::repeat_n(T::default(), count));
     let sums = records
         .par_chunks_mut(per)
@@ -1093,8 +1167,9 @@ fn checksum(region: u64, index: usize, bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::flat::{DIRECTORY, FILE};
+    use super::super::flat::reference;
     use super::*;
+    use crate::tree::{DIRECTORY, FILE, IDENTIFIED};
 
     const JOURNAL: Journal = Journal {
         id: 0xABCD,
@@ -1113,11 +1188,10 @@ mod tests {
     }
 
     /// The root holding `sub` and `résumé.txt`, a file with two names, and
-    /// `sub` holding `file.txt`.
-    fn tree() -> Flat {
+    /// `sub` holding `file.txt`: as a kept tree loads, in one segment.
+    fn tree() -> Tree {
         let dir = |record, first, len, parent, bytes| Dir {
-            record,
-            sequence: 1,
+            id: reference(record, 1),
             first,
             len,
             parent,
@@ -1127,26 +1201,46 @@ mod tests {
             files: len.into(),
             dirs: 1,
             modified: 9,
+            ..Dir::EMPTY
         };
         let item = |record, at, len, kind, value| Item {
-            record,
-            sequence: 3,
+            id: reference(record, 3),
             at,
             len,
             kind,
-            shared: record == 30,
+            flags: if record == 30 { IDENTIFIED } else { 0 },
             value,
             modified: 7,
+            volume: 0,
         };
-        Flat {
+        Tree {
+            name: Box::default(),
             dirs: vec![dir(5, 0, 2, NONE, 12_288), dir(20, 2, 1, 0, 4096)],
-            items: vec![
-                item(30, 3, 12, FILE, 8192),
-                item(20, 0, 3, DIRECTORY, 1),
-                item(31, 15, 8, FILE, 4096),
-            ],
-            text: "subr\u{e9}sum\u{e9}.txtfile.txt".as_bytes().to_vec(),
+            segs: vec![Seg {
+                items: vec![
+                    item(30, 3, 12, FILE, 8192),
+                    item(20, 0, 3, DIRECTORY, 1),
+                    item(31, 15, 8, FILE, 4096),
+                ],
+                text: "subr\u{e9}sum\u{e9}.txtfile.txt".to_owned(),
+            }],
+            volumes: vec![0],
         }
+    }
+
+    /// [`tree`] as a build leaves it: `sub`'s entries in a segment of
+    /// their own.
+    fn split() -> Tree {
+        let mut tree = tree();
+        let file = tree.segs[0].items.pop().expect("file.txt");
+        tree.segs[0].text.truncate(15);
+        tree.segs.push(Seg {
+            items: vec![Item { at: 0, ..file }],
+            text: "file.txt".to_owned(),
+        });
+        tree.dirs[1].seg = 1;
+        tree.dirs[1].first = 0;
+        tree
     }
 
     #[test]
@@ -1163,15 +1257,18 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let file = file(dir.path(), 'C');
         let key = key(&options);
-        let saved = tree();
+        let saved = split();
         assert!(saved.is_valid());
         save(&file, 7, 1024, key, &saved, &checkpoint).expect("saved");
 
         let (loaded, kept) =
             load(&file, &geometry(7), JOURNAL, key).expect("loads");
+        let expected = tree();
+        assert_eq!(loaded.dirs, expected.dirs);
+        assert_eq!(loaded.segs.len(), 1);
         assert_eq!(
-            (&loaded.dirs, &loaded.items, &loaded.text),
-            (&saved.dirs, &saved.items, &saved.text)
+            (&loaded.segs[0].items, &loaded.segs[0].text),
+            (&expected.segs[0].items, &expected.segs[0].text)
         );
         assert_eq!(
             (kept.journal, kept.next, kept.open, kept.revisit, kept.big),
@@ -1235,7 +1332,7 @@ mod tests {
         // Nor is one that is not a tree: a folder named twice would be
         // built twice, each time for every level such names repeat.
         let mut twice = tree();
-        twice.items[0] = twice.items[1];
+        twice.segs[0].items[0] = twice.segs[0].items[1];
         assert!(!twice.is_valid());
         save(&file, 7, 1024, key, &twice, &checkpoint).expect("saved");
         assert!(load(&file, &geometry(7), JOURNAL, key).is_none());
@@ -1244,3 +1341,4 @@ mod tests {
         assert!(!elsewhere.is_valid());
     }
 }
+

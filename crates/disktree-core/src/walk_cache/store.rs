@@ -1,25 +1,28 @@
-//! A finished walk of one volume kept on disk: a header, the root path, the
-//! files last seen open, then every node depth first. A leaf keeps only its
-//! own size, its count following from its kind; a directory keeps its
-//! totals, so nothing is summed again on load. Identities keep only the
-//! file number, their device being the state's volume.
-//! Anything that does not check out (another format, a torn or
-//! damaged file, a count or name that cannot be) loads as nothing, and the
-//! caller walks again.
+//! A finished walk of one volume kept on disk: a header, the root path,
+//! the files last seen open, then the tree a directory at a time, every
+//! directory's entries after those of the directories above it, so each
+//! run reads back into place. A leaf keeps its size, its count following
+//! from its kind; a directory keeps its totals, so nothing is summed again
+//! on load. Identities keep only the file number, their device being the
+//! state's volume. The file is written and read as it streams, a megabyte
+//! at a time, never whole in memory. Anything that does not check out
+//! (another format, a torn or damaged file, a count or name that cannot
+//! be) loads as nothing, and the caller walks again.
 
 use std::hash::Hasher as _;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read, Seek as _, SeekFrom, Write};
 use std::path::Path;
 
-use rayon::prelude::*;
 use rustc_hash::FxHasher;
 
-use crate::classify::{Category, Reclaim};
-use crate::tree::{Node, NodeKind};
+use crate::tree::{
+    DIRECTORY, Dir, IDENTIFIED, Item, READ_ERROR, Seg, Tree, code,
+    decode as kind_of,
+};
 
 /// Bumped for layout or scan-policy changes, including incomplete listings.
 /// Older snapshots must not hide an error the newer walk would retry.
-const MAGIC: [u8; 8] = *b"dtwalk\x00\x03";
+const MAGIC: [u8; 8] = *b"dtwalk\x00\x04";
 
 /// Largest file kept or read, header included.
 const MOST_BYTES: usize = 1 << 30;
@@ -28,21 +31,25 @@ const MOST_NODES: u64 = 10_000_000;
 const MOST_DEPTH: usize = 512;
 
 /// Magic, checksum of everything after it, then volume, root id, journal,
-/// next, created, options, and the counts of open files, root bytes and
-/// nodes.
-const HEADER: usize = 8 * 11;
+/// next, created, options, and the counts of open files, root bytes,
+/// nodes, directories and name bytes.
+const HEADER: usize = 8 * 13;
+#[cfg(test)]
 const NODE_COUNT_AT: usize = 80;
 
-/// Fewest bytes a node takes: tag, classes, a one-byte name and its
-/// length, modified and own bytes.
-const LEAST_RECORD: usize = 6;
+/// Fewest bytes a node takes: tag, a one-byte name and its length,
+/// modified and size.
+const LEAST_RECORD: usize = 5;
+
+/// Bytes hashed at a time: see [`checksum`].
+const PART: usize = 1 << 20;
 
 /// Tag bits: the kind, then flags. Anything above `KNOWN` is damage.
 const KIND: u8 = 0b11;
-const READ_ERROR: u8 = 1 << 2;
+const BROKEN: u8 = 1 << 2;
 /// A file number follows; its device is the state's volume.
 const INODE: u8 = 1 << 3;
-const KNOWN: u8 = KIND | READ_ERROR | INODE;
+const KNOWN: u8 = KIND | BROKEN | INODE;
 
 /// What the next scan starts from.
 #[derive(Debug)]
@@ -56,43 +63,161 @@ pub(super) struct State {
     pub created: u64,
     pub options: u64,
     pub open: Vec<u64>,
-    pub tree: Node,
+    pub tree: Tree,
 }
 
 /// The state kept in `path`, if it is whole and of this format.
 pub(super) fn load(path: &Path) -> Option<State> {
-    let mut file = crate::windows::cache_read(path)?;
+    let file = crate::windows::cache_read(path)?;
     let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
-    if len > MOST_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(len);
-    (&mut file)
-        .take(MOST_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    decode(&bytes)
+    decode(file, len)
 }
 
 /// Write `state` to `path`, whole or not at all: a failed or interrupted
 /// save leaves whatever was there before. Not synced: a crash that loses
 /// the new bytes fails the checksum, and the next scan walks again.
 pub(super) fn save(path: &Path, state: &State) -> io::Result<()> {
-    let bytes = encode(state)?;
-    crate::windows::cache_write(path, |out| out.write_all(&bytes))
+    crate::windows::cache_write(path, |out| {
+        let sum = encode(state, &mut *out)?;
+        out.seek(SeekFrom::Start(8))?;
+        out.write_all(&sum.to_le_bytes())
+    })
 }
 
-fn encode(state: &State) -> io::Result<Vec<u8>> {
+/// A check a torn or damaged file fails: the length of everything past
+/// the checksum, then a hash of each megabyte of it in turn.
+fn checksum(len: usize, parts: &[u64]) -> u64 {
+    let mut hasher = FxHasher::default();
+    hasher.write_usize(len);
+    for &part in parts {
+        hasher.write_u64(part);
+    }
+    hasher.finish()
+}
+
+fn part(bytes: &[u8]) -> u64 {
+    let mut hasher = FxHasher::default();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+/// Bytes written out a part at a time, each part hashed on the way; the
+/// first sixteen, the magic and the checksum's place, are not.
+struct Sealed<W: Write> {
+    out: W,
+    part: Vec<u8>,
+    parts: Vec<u64>,
+    /// Bytes hashed so far.
+    len: usize,
+    /// Bytes still to pass before hashing starts.
+    head: usize,
+}
+
+impl<W: Write> Sealed<W> {
+    fn new(out: W) -> Self {
+        Self {
+            out,
+            part: Vec::with_capacity(PART),
+            parts: Vec::new(),
+            len: 0,
+            head: 16,
+        }
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        if self.head > 0 {
+            let (head, rest) = bytes.split_at(self.head.min(bytes.len()));
+            self.out.write_all(head)?;
+            self.head -= head.len();
+            bytes = rest;
+        }
+        self.len += bytes.len();
+        if self.len + HEADER > MOST_BYTES {
+            return Err(too_large());
+        }
+        while !bytes.is_empty() {
+            let room = PART - self.part.len();
+            let (now, later) = bytes.split_at(room.min(bytes.len()));
+            self.part.extend_from_slice(now);
+            bytes = later;
+            if self.part.len() == PART {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.parts.push(part(&self.part));
+        self.out.write_all(&self.part)?;
+        self.part.clear();
+        Ok(())
+    }
+
+    fn u64(&mut self, value: u64) -> io::Result<()> {
+        self.write(&value.to_le_bytes())
+    }
+
+    fn varint(&mut self, mut value: u64) -> io::Result<()> {
+        let mut bytes = [0; 10];
+        let mut len = 0;
+        while value >= 0x80 {
+            bytes[len] = value as u8 | 0x80;
+            value >>= 7;
+            len += 1;
+        }
+        bytes[len] = value as u8;
+        self.write(&bytes[..=len])
+    }
+
+    /// The checksum of everything written.
+    fn finish(mut self) -> io::Result<u64> {
+        if !self.part.is_empty() {
+            self.flush()?;
+        }
+        self.out.flush()?;
+        Ok(checksum(self.len, &self.parts))
+    }
+}
+
+/// Write `state` to `out`, the checksum's place left zero; returns the
+/// checksum, which belongs at byte 8.
+fn encode(state: &State, out: impl Write) -> io::Result<u64> {
     if state.root.contains('\0') {
         return Err(invalid("root path holds a NUL"));
     }
-    let hint =
-        usize::try_from(state.tree.files.saturating_add(state.tree.dirs))
-            .unwrap_or(usize::MAX)
-            .saturating_mul(24)
-            .min(MOST_BYTES);
-    let mut out = Vec::with_capacity(hint);
-    out.extend_from_slice(&MAGIC);
+    let tree = &state.tree;
+    // Every directory in the order its entries are written, with its
+    // depth: counted first, as the header gives the counts.
+    let mut order: Vec<(u32, usize)> = vec![(0, 0)];
+    let mut nodes: u64 = 1;
+    // Names below the root: the root's is kept apart from them.
+    let mut text: u64 = 0;
+    let mut at = 0;
+    while let Some(&(index, depth)) = order.get(at) {
+        let dir = tree
+            .dirs
+            .get(index as usize)
+            .ok_or_else(|| invalid("no such directory"))?;
+        let run = tree.run(dir);
+        if !run.is_empty() && depth >= MOST_DEPTH {
+            return Err(too_large());
+        }
+        for item in run {
+            nodes += 1;
+            text += u64::from(item.len);
+            if item.kind == DIRECTORY {
+                order.push((item.value as u32, depth + 1));
+            }
+        }
+        // A tree that loops never stops growing past this.
+        if nodes > MOST_NODES {
+            return Err(too_large());
+        }
+        at += 1;
+    }
+    let mut out = Sealed::new(out);
+    out.write(&MAGIC)?;
     for value in [
         0,
         state.volume,
@@ -103,183 +228,165 @@ fn encode(state: &State) -> io::Result<Vec<u8>> {
         state.options,
         state.open.len() as u64,
         state.root.len() as u64,
-        0,
+        nodes,
+        order.len() as u64,
+        text,
     ] {
-        out.extend_from_slice(&value.to_le_bytes());
+        out.u64(value)?;
     }
-    out.extend_from_slice(state.root.as_bytes());
-    for number in &state.open {
-        out.extend_from_slice(&number.to_le_bytes());
+    out.write(state.root.as_bytes())?;
+    for &number in &state.open {
+        out.u64(number)?;
     }
-    let mut writer = Writer {
-        out,
-        nodes: 0,
-        volume: state.volume,
-    };
-    writer.node(&state.tree, 0)?;
-    let Writer { mut out, nodes, .. } = writer;
-    if out.len() > MOST_BYTES {
-        return Err(too_large());
-    }
-    out[NODE_COUNT_AT..HEADER].copy_from_slice(&nodes.to_le_bytes());
-    let sum = checksum(&out[16..]);
-    out[8..16].copy_from_slice(&sum.to_le_bytes());
-    Ok(out)
-}
-
-fn decode(bytes: &[u8]) -> Option<State> {
-    if bytes.len() < HEADER || bytes.len() > MOST_BYTES || bytes[..8] != MAGIC {
-        return None;
-    }
-    let mut reader = Reader {
-        bytes,
-        at: 8,
-        nodes_left: 0,
-        volume: 0,
-    };
-    if reader.u64()? != checksum(&bytes[16..]) {
-        return None;
-    }
-    let volume = reader.u64()?;
-    let root_id = reader.u64()?;
-    let journal = reader.u64()?;
-    let next = reader.u64()?;
-    let created = reader.u64()?;
-    let options = reader.u64()?;
-    let open = usize::try_from(reader.u64()?).ok()?;
-    let root = usize::try_from(reader.u64()?).ok()?;
-    let nodes = reader.u64()?;
-    if nodes == 0 || nodes > MOST_NODES {
-        return None;
-    }
-    let root = std::str::from_utf8(reader.take(root)?).ok()?;
-    if root.contains('\0') {
-        return None;
-    }
-    let open = reader
-        .take(open.checked_mul(8)?)?
-        .chunks_exact(8)
-        .map(|word| u64::from_le_bytes(word.try_into().unwrap_or_default()))
-        .collect();
-    reader.nodes_left = nodes;
-    reader.volume = volume;
-    let tree = reader.node(0)?;
-    if reader.nodes_left != 0 || reader.at != bytes.len() {
-        return None;
-    }
-    Some(State {
-        root: root.to_owned(),
-        volume,
-        root_id,
-        journal,
-        next,
-        created,
-        options,
-        open,
-        tree,
-    })
-}
-
-/// Nodes appended depth first to one buffer.
-struct Writer {
-    out: Vec<u8>,
-    nodes: u64,
-    /// The device every kept identity must be on; only the file number is
-    /// written.
-    volume: u64,
-}
-
-impl Writer {
-    fn node(&mut self, node: &Node, depth: usize) -> io::Result<()> {
-        self.nodes += 1;
-        if self.nodes > MOST_NODES || self.out.len() > MOST_BYTES {
-            return Err(too_large());
-        }
-        if !name_fits(&node.name, depth) {
-            return Err(invalid("a name cannot be kept"));
-        }
-        let dir = node.is_dir();
-        if !dir
-            && (!node.children.is_empty()
-                || node.bytes != node.own_bytes
-                || node.files != u64::from(node.kind == NodeKind::File)
-                || node.own_files != node.files
-                || node.dirs != 0)
-        {
-            return Err(invalid("a leaf is not settled"));
-        }
-        if !node.children.is_empty() && depth >= MOST_DEPTH {
-            return Err(too_large());
-        }
-        let inode = match node.inode {
-            Some((device, inode)) if device == self.volume => Some(inode),
-            Some(_) => return Err(invalid("an identity of another volume")),
-            None => None,
+    let root = tree.dirs.first().copied().unwrap_or(Dir::EMPTY);
+    write_dir(&mut out, state, &tree.name, &root, 0)?;
+    for &(index, depth) in &order {
+        let Some(dir) = tree.dirs.get(index as usize) else {
+            continue;
         };
-        let tag = kind_code(node.kind)
-            | if node.read_error { READ_ERROR } else { 0 }
-            | if inode.is_some() { INODE } else { 0 };
-        self.out.push(tag);
-        self.out.push(
-            category_code(node.category)
-                | (node.reclaim.map_or(0, reclaim_code) << 4),
-        );
-        self.varint(node.name.len() as u64);
-        self.out.extend_from_slice(node.name.as_bytes());
-        let modified = node.modified;
-        self.varint(((modified << 1) ^ (modified >> 63)).cast_unsigned());
-        if let Some(inode) = inode {
-            self.varint(inode);
-        }
-        if dir {
-            self.varint(node.bytes);
-            self.varint(node.own_bytes);
-            self.varint(node.files);
-            self.varint(node.own_files);
-            self.varint(node.dirs);
-        } else {
-            self.varint(node.own_bytes);
-        }
-        if dir {
-            self.varint(node.children.len() as u64);
-            for child in &node.children {
-                self.node(child, depth + 1)?;
+        for item in tree.run(dir) {
+            let name = tree.text(dir.seg, item);
+            if item.kind == DIRECTORY {
+                let child = tree
+                    .dir(item.value)
+                    .ok_or_else(|| invalid("no such directory"))?;
+                write_dir(&mut out, state, name, child, depth + 1)?;
+            } else {
+                write_leaf(&mut out, state, name, item, depth + 1)?;
             }
         }
-        Ok(())
     }
+    out.finish()
+}
 
-    fn varint(&mut self, mut value: u64) {
-        while value >= 0x80 {
-            self.out.push(value as u8 | 0x80);
-            value >>= 7;
+/// `id`, whose device is `volume` in the tree, as the file keeps it.
+fn identity(state: &State, volume: u16, id: u64) -> io::Result<u64> {
+    if state.tree.volume(volume) == state.volume {
+        Ok(id)
+    } else {
+        Err(invalid("an identity of another volume"))
+    }
+}
+
+/// A leaf: tag, modified, identity, size, then its name, last so a
+/// reader takes it straight from what it read in.
+fn write_leaf<W: Write>(
+    out: &mut Sealed<W>,
+    state: &State,
+    name: &str,
+    item: &Item,
+    depth: usize,
+) -> io::Result<()> {
+    let inode = item.identified().then_some(item.id);
+    out.write(&[item.kind | if inode.is_some() { INODE } else { 0 }])?;
+    out.varint(u64::from(item.modified))?;
+    if let Some(inode) = inode {
+        out.varint(identity(state, item.volume, inode)?)?;
+    }
+    out.varint(item.value)?;
+    write_name(out, name, depth)
+}
+
+/// A directory: tag, kinds, modified, identity, totals and count of
+/// entries, then its name.
+fn write_dir<W: Write>(
+    out: &mut Sealed<W>,
+    state: &State,
+    name: &str,
+    dir: &Dir,
+    depth: usize,
+) -> io::Result<()> {
+    let inode = dir.identified().then_some(dir.id);
+    let tag = DIRECTORY
+        | if dir.flags & READ_ERROR != 0 {
+            BROKEN
+        } else {
+            0
         }
-        self.out.push(value as u8);
+        | if inode.is_some() { INODE } else { 0 };
+    // An undecided kind is kept as none.
+    let (category, reclaim) = kind_of((dir.category, dir.reclaim));
+    let (category, reclaim) = code(category, reclaim);
+    out.write(&[tag, category | reclaim << 4])?;
+    out.varint(u64::from(dir.modified))?;
+    if let Some(inode) = inode {
+        out.varint(identity(state, dir.volume, inode)?)?;
     }
+    out.varint(dir.bytes)?;
+    out.varint(dir.files)?;
+    out.varint(u64::from(dir.dirs))?;
+    out.varint(u64::from(dir.len))?;
+    write_name(out, name, depth)
 }
 
-/// A cursor over a loaded file; every read fails past its end.
-struct Reader<'a> {
-    bytes: &'a [u8],
+fn write_name<W: Write>(
+    out: &mut Sealed<W>,
+    name: &str,
+    depth: usize,
+) -> io::Result<()> {
+    if !name_fits(name, depth) {
+        return Err(invalid("a name cannot be kept"));
+    }
+    out.varint(name.len() as u64)?;
+    out.write(name.as_bytes())
+}
+
+/// Bytes read in as they are needed, a part at a time, each part hashed
+/// as it comes in.
+struct Stream<R: Read> {
+    input: R,
+    block: Vec<u8>,
     at: usize,
-    /// Nodes the header promises and the tree has not yet used.
-    nodes_left: u64,
-    /// Every kept identity's device.
-    volume: u64,
+    /// Hashed bytes not read in yet.
+    left: usize,
+    /// All the hashed bytes.
+    len: usize,
+    parts: Vec<u64>,
+    /// A name that crosses from one part into the next, put together.
+    spill: Vec<u8>,
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
-        let end = self.at.checked_add(len)?;
-        let bytes = self.bytes.get(self.at..end)?;
-        self.at = end;
-        Some(bytes)
+impl<R: Read> Stream<R> {
+    fn refill(&mut self) -> Option<()> {
+        let size = PART.min(self.left);
+        if size == 0 {
+            return None;
+        }
+        self.block.resize(size, 0);
+        self.input.read_exact(&mut self.block).ok()?;
+        self.parts.push(part(&self.block));
+        self.left -= size;
+        self.at = 0;
+        Some(())
     }
 
     fn byte(&mut self) -> Option<u8> {
-        let byte = *self.bytes.get(self.at)?;
+        if self.at == self.block.len() {
+            self.refill()?;
+        }
+        let byte = self.block[self.at];
         self.at += 1;
         Some(byte)
+    }
+
+    fn take(&mut self, len: usize) -> Option<&[u8]> {
+        if self.block.len() - self.at >= len {
+            let bytes = &self.block[self.at..self.at + len];
+            self.at += len;
+            return Some(bytes);
+        }
+        self.spill.clear();
+        while self.spill.len() < len {
+            if self.at == self.block.len() {
+                self.refill()?;
+            }
+            let count =
+                (len - self.spill.len()).min(self.block.len() - self.at);
+            self.spill
+                .extend_from_slice(&self.block[self.at..self.at + count]);
+            self.at += count;
+        }
+        Some(&self.spill)
     }
 
     fn u64(&mut self) -> Option<u64> {
@@ -302,79 +409,199 @@ impl<'a> Reader<'a> {
         None
     }
 
-    fn node(&mut self, depth: usize) -> Option<Node> {
-        self.nodes_left = self.nodes_left.checked_sub(1)?;
+    fn count(&mut self) -> Option<usize> {
+        usize::try_from(self.u64()?).ok()
+    }
+
+    /// Whether everything was read, and it is what was written.
+    fn whole(&self, sum: u64) -> bool {
+        self.at == self.block.len()
+            && self.left == 0
+            && checksum(self.len, &self.parts) == sum
+    }
+}
+
+/// One node as the file keeps it.
+struct Record<'a> {
+    name: &'a str,
+    item: Item,
+    /// A directory's own facts, and how many entries it holds.
+    dir: Option<(Dir, usize)>,
+}
+
+impl<R: Read> Stream<R> {
+    fn record(&mut self, depth: usize) -> Option<Record<'_>> {
         let tag = self.byte()?;
         if tag & !KNOWN != 0 {
             return None;
         }
-        let kind = kind_from(tag & KIND);
-        let classes = self.byte()?;
-        let category = category_from(classes & 0x0F)?;
-        let reclaim = match classes >> 4 {
-            0 => None,
-            code => Some(reclaim_from(code)?),
+        let kind = tag & KIND;
+        let classes = if kind == DIRECTORY {
+            let classes = self.byte()?;
+            (category_from(classes & 0x0F)?, reclaim_from(classes >> 4)?)
+        } else if tag & BROKEN != 0 {
+            return None;
+        } else {
+            (0, 0)
+        };
+        let modified = u32::try_from(self.varint()?).ok()?;
+        let inode = if tag & INODE == 0 {
+            None
+        } else {
+            Some(self.varint()?)
+        };
+        let mut item = Item {
+            modified,
+            kind,
+            ..Item::default()
+        };
+        if let Some(id) = inode {
+            item.id = id;
+            item.flags = IDENTIFIED;
+        }
+        let dir = if kind == DIRECTORY {
+            let mut dir = Dir {
+                bytes: self.varint()?,
+                files: self.varint()?,
+                dirs: u32::try_from(self.varint()?).ok()?,
+                modified,
+                category: classes.0,
+                reclaim: classes.1,
+                flags: if tag & BROKEN == 0 { 0 } else { READ_ERROR },
+                ..Dir::EMPTY
+            };
+            if let Some(id) = inode {
+                dir.id = id;
+                dir.flags |= IDENTIFIED;
+            }
+            Some((dir, usize::try_from(self.varint()?).ok()?))
+        } else {
+            item.value = self.varint()?;
+            None
         };
         let len = usize::try_from(self.varint()?).ok()?;
         let name = std::str::from_utf8(self.take(len)?).ok()?;
         if !name_fits(name, depth) {
             return None;
         }
-        let modified = self.varint()?;
-        let modified = (modified >> 1).cast_signed()
-            ^ (modified & 1).cast_signed().wrapping_neg();
-        let inode = if tag & INODE == 0 {
-            None
-        } else {
-            Some((self.volume, self.varint()?))
-        };
-        let (bytes, own_bytes, files, own_files, dirs) = if kind.is_dir() {
-            (
-                self.varint()?,
-                self.varint()?,
-                self.varint()?,
-                self.varint()?,
-                self.varint()?,
-            )
-        } else {
-            let own_bytes = self.varint()?;
-            let files = u64::from(kind == NodeKind::File);
-            (own_bytes, own_bytes, files, files, 0)
-        };
-        let children = if kind.is_dir() {
-            let count = usize::try_from(self.varint()?).ok()?;
-            // Bounded before anything is allocated: a count no remaining
-            // node or byte could fill is damage.
-            if (count > 0 && depth >= MOST_DEPTH)
-                || count as u64 > self.nodes_left
-                || count > (self.bytes.len() - self.at) / LEAST_RECORD
-            {
-                return None;
-            }
-            let mut children = Vec::with_capacity(count);
-            for _ in 0..count {
-                children.push(self.node(depth + 1)?);
-            }
-            children
-        } else {
-            Vec::new()
-        };
-        Some(Node {
-            name: name.into(),
-            kind,
-            bytes,
-            own_bytes,
-            files,
-            own_files,
-            dirs,
-            inode,
-            read_error: tag & READ_ERROR != 0,
-            modified,
-            category,
-            reclaim,
-            children,
-        })
+        Some(Record { name, item, dir })
     }
+}
+
+fn decode(input: impl Read, len: usize) -> Option<State> {
+    if !(HEADER..=MOST_BYTES).contains(&len) {
+        return None;
+    }
+    let mut stream = Stream {
+        input,
+        block: Vec::with_capacity(PART.min(len)),
+        at: 0,
+        left: len - 16,
+        len: len - 16,
+        parts: Vec::new(),
+        spill: Vec::new(),
+    };
+    let mut head = [0_u8; 16];
+    stream.input.read_exact(&mut head).ok()?;
+    if head[..8] != MAGIC {
+        return None;
+    }
+    let sum = u64::from_le_bytes(head[8..].try_into().ok()?);
+    let volume = stream.u64()?;
+    let root_id = stream.u64()?;
+    let journal = stream.u64()?;
+    let next = stream.u64()?;
+    let created = stream.u64()?;
+    let options = stream.u64()?;
+    let open = stream.count()?;
+    let root = stream.count()?;
+    let nodes = stream.u64()?;
+    let dirs = stream.count()?;
+    let text = stream.count()?;
+    // Bounded before anything is sized by them: a count no byte of the
+    // file could fill is damage.
+    if nodes == 0
+        || nodes > MOST_NODES
+        || nodes as usize > len / LEAST_RECORD
+        || dirs as u64 > nodes
+        || text > len
+        || open > len / 8
+    {
+        return None;
+    }
+    let root = std::str::from_utf8(stream.take(root)?).ok()?.to_owned();
+    if root.contains('\0') {
+        return None;
+    }
+    let open = (0..open)
+        .map(|_| stream.u64())
+        .collect::<Option<Vec<u64>>>()?;
+    let mut tree = Tree {
+        name: Box::default(),
+        dirs: Vec::with_capacity(dirs),
+        segs: vec![Seg {
+            items: Vec::with_capacity(nodes as usize - 1),
+            text: String::with_capacity(text),
+        }],
+        volumes: vec![volume],
+    };
+    // Each directory's count of entries and depth, as it comes in.
+    let mut shape: Vec<(usize, usize)> = Vec::with_capacity(dirs);
+    let Record { name, dir, .. } = stream.record(0)?;
+    let (root_dir, count) = dir?;
+    tree.name = name.into();
+    tree.dirs.push(root_dir);
+    shape.push((count, 0));
+    let mut nodes_left = nodes - 1;
+    let mut at = 0;
+    while let Some(&(count, depth)) = shape.get(at) {
+        if (count > 0 && depth >= MOST_DEPTH) || count as u64 > nodes_left {
+            return None;
+        }
+        nodes_left -= count as u64;
+        let first = tree.segs[0].items.len() as u32;
+        for _ in 0..count {
+            let Record {
+                name,
+                mut item,
+                dir,
+            } = stream.record(depth + 1)?;
+            if let Some((mut dir, count)) = dir {
+                item.value = tree.dirs.len() as u64;
+                dir.parent = at as u32;
+                tree.dirs.push(dir);
+                shape.push((count, depth + 1));
+            }
+            let seg = &mut tree.segs[0];
+            item.at = seg.text.len() as u32;
+            item.len = name.len() as u16;
+            seg.text.push_str(name);
+            seg.items.push(item);
+        }
+        let dir = &mut tree.dirs[at];
+        dir.first = first;
+        dir.len = count as u32;
+        at += 1;
+    }
+    let seg = &tree.segs[0];
+    if nodes_left != 0
+        || tree.dirs.len() != dirs
+        || seg.text.len() != text
+        || !stream.whole(sum)
+    {
+        return None;
+    }
+    Some(State {
+        root,
+        volume,
+        root_id,
+        journal,
+        next,
+        created,
+        options,
+        open,
+        tree,
+    })
 }
 
 /// A name below the root is one path component, with no `:` that Windows
@@ -392,100 +619,22 @@ fn name_fits(name: &str, depth: usize) -> bool {
         })
 }
 
-const fn kind_code(kind: NodeKind) -> u8 {
-    match kind {
-        NodeKind::Directory => 0,
-        NodeKind::File => 1,
-        NodeKind::Symlink => 2,
-        NodeKind::Other => 3,
+/// A category as [`code`] numbers it: the legend's, and `Other` after.
+const fn category_from(code: u8) -> Option<u8> {
+    if code as usize <= crate::classify::Category::LEGEND.len() {
+        Some(code)
+    } else {
+        None
     }
 }
 
-const fn kind_from(code: u8) -> NodeKind {
-    match code {
-        0 => NodeKind::Directory,
-        1 => NodeKind::File,
-        2 => NodeKind::Symlink,
-        _ => NodeKind::Other,
+/// A reason as [`code`] numbers it: `0` for none.
+const fn reclaim_from(code: u8) -> Option<u8> {
+    if code as usize <= crate::classify::Reclaim::ALL.len() {
+        Some(code)
+    } else {
+        None
     }
-}
-
-const fn category_code(category: Category) -> u8 {
-    match category {
-        Category::Code => 0,
-        Category::AgentScratch => 1,
-        Category::Toolchain => 2,
-        Category::Synced => 3,
-        Category::Git => 4,
-        Category::Media => 5,
-        Category::Documents => 6,
-        Category::Cache => 7,
-        Category::Other => 8,
-    }
-}
-
-const fn category_from(code: u8) -> Option<Category> {
-    Some(match code {
-        0 => Category::Code,
-        1 => Category::AgentScratch,
-        2 => Category::Toolchain,
-        3 => Category::Synced,
-        4 => Category::Git,
-        5 => Category::Media,
-        6 => Category::Documents,
-        7 => Category::Cache,
-        8 => Category::Other,
-        _ => return None,
-    })
-}
-
-/// `0` is kept for no reason at all.
-const fn reclaim_code(reclaim: Reclaim) -> u8 {
-    match reclaim {
-        Reclaim::Regenerable => 1,
-        Reclaim::SyncHistory => 2,
-        Reclaim::PackageStore => 3,
-        Reclaim::BuildOutput => 4,
-        Reclaim::Reinstallable => 5,
-        Reclaim::SandboxLayers => 6,
-        Reclaim::Snapshots => 7,
-        Reclaim::Trash => 8,
-        Reclaim::Temporary => 9,
-    }
-}
-
-const fn reclaim_from(code: u8) -> Option<Reclaim> {
-    Some(match code {
-        1 => Reclaim::Regenerable,
-        2 => Reclaim::SyncHistory,
-        3 => Reclaim::PackageStore,
-        4 => Reclaim::BuildOutput,
-        5 => Reclaim::Reinstallable,
-        6 => Reclaim::SandboxLayers,
-        7 => Reclaim::Snapshots,
-        8 => Reclaim::Trash,
-        9 => Reclaim::Temporary,
-        _ => return None,
-    })
-}
-
-/// A check a torn or damaged file fails: each megabyte hashed on a thread
-/// of its own, then the hashes in order.
-fn checksum(bytes: &[u8]) -> u64 {
-    let parts: Vec<u64> = bytes
-        .par_chunks(1 << 20)
-        .map(|chunk| {
-            let mut hasher = FxHasher::default();
-            hasher.write(chunk);
-            hasher.finish()
-        })
-        .collect();
-    let mut hasher = FxHasher::default();
-    hasher.write_usize(bytes.len());
-    for part in parts {
-        hasher.write_u64(part);
-    }
-    hasher.finish()
 }
 
 fn invalid(reason: &str) -> io::Error {
@@ -499,44 +648,51 @@ fn too_large() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn leaf(name: &str, kind: NodeKind, bytes: u64) -> Node {
-        Node::entry(name, kind, bytes)
-    }
+    use crate::classify::{Category, Reclaim};
+    use crate::tree::{Draft, Metric, Node, NodeKind};
 
     const VOLUME: u64 = 0xDEAD_BEEF;
 
+    fn leaf(name: &str, kind: NodeKind, bytes: u64) -> Draft {
+        Draft::entry(name, kind, bytes)
+    }
+
+    fn dir(name: &str, children: Vec<Draft>) -> Draft {
+        Draft {
+            children,
+            ..Draft::directory(name)
+        }
+    }
+
     /// A finished tree of one volume with every kind, flag and class.
-    fn sample() -> Node {
+    fn sample() -> Tree {
         let mut file = leaf("a.txt", NodeKind::File, 1234);
         file.inode = Some((VOLUME, 0xFFFF_0000_0000_1234));
-        file.modified = -5;
-        file.category = Category::Documents;
+        file.modified = 5;
         // A second name of a file already charged: no weight of its own.
         let mut link = leaf("hard", NodeKind::File, 0);
         link.inode = Some((VOLUME, 0xFFFF_0000_0000_1234));
         let mut odd = leaf("ödd ✓", NodeKind::File, 10);
-        odd.modified = 17;
-        let mut sub = Node::directory("src");
+        odd.modified = i64::from(u32::MAX);
+        let mut sub = dir(
+            "src",
+            vec![
+                leaf("link", NodeKind::Symlink, 0),
+                leaf("fifo", NodeKind::Other, 0),
+                Draft::directory("empty"),
+            ],
+        );
         sub.read_error = true;
         sub.inode = Some((VOLUME, 42));
         sub.category = Category::Code;
         sub.reclaim = Some(Reclaim::Temporary);
-        sub.modified = i64::MAX;
-        sub.children = vec![
-            leaf("link", NodeKind::Symlink, 0),
-            leaf("fifo", NodeKind::Other, 0),
-            Node::directory("empty"),
-        ];
-        let mut root = Node::directory("C:\\");
+        let mut root = dir("C:\\", vec![sub, file, link, odd]);
         root.reclaim = Some(Reclaim::Regenerable);
-        root.modified = i64::MIN;
-        root.children = vec![sub, file, link, odd];
-        crate::tree::aggregate(&mut root, crate::tree::Metric::Bytes);
-        root
+        root.inode = Some((VOLUME, 5));
+        Tree::from_draft(root, Metric::Bytes)
     }
 
-    fn state(tree: Node) -> State {
+    fn state(tree: Tree) -> State {
         State {
             root: "C:\\Users\\me".to_owned(),
             volume: VOLUME,
@@ -550,8 +706,20 @@ mod tests {
         }
     }
 
+    fn encoded(state: &State) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let sum = encode(state, &mut bytes)?;
+        bytes[8..16].copy_from_slice(&sum.to_le_bytes());
+        Ok(bytes)
+    }
+
+    fn decoded(bytes: &[u8]) -> Option<State> {
+        decode(bytes, bytes.len())
+    }
+
     fn reseal(bytes: &mut [u8]) {
-        let sum = checksum(&bytes[16..]);
+        let parts: Vec<u64> = bytes[16..].chunks(PART).map(part).collect();
+        let sum = checksum(bytes.len() - 16, &parts);
         bytes[8..16].copy_from_slice(&sum.to_le_bytes());
     }
 
@@ -562,6 +730,39 @@ mod tests {
         HEADER + word(72) + word(64) * 8
     }
 
+    /// Every node as a line: its path and all it says.
+    fn lines(state: &State) -> Vec<String> {
+        fn describe(node: Node<'_>, path: &str, out: &mut Vec<String>) {
+            out.push(format!(
+                "{path} {:?} {} {} {} {:?} {} {:?} {}",
+                node.kind(),
+                node.bytes(),
+                node.files(),
+                node.dirs(),
+                node.inode(),
+                node.modified(),
+                node.kinds(),
+                node.read_error(),
+            ));
+            for child in node.children() {
+                describe(child, &format!("{path}/{}", child.name()), out);
+            }
+        }
+        let mut out = vec![format!(
+            "{} {} {} {} {} {} {} {:?}",
+            state.root,
+            state.volume,
+            state.root_id,
+            state.journal,
+            state.next,
+            state.created,
+            state.options,
+            state.open
+        )];
+        describe(state.tree.root(), state.tree.root().name(), &mut out);
+        out
+    }
+
     #[test]
     fn a_saved_state_loads_as_it_was() {
         let dir = tempfile::tempdir().unwrap();
@@ -569,7 +770,30 @@ mod tests {
         let kept = state(sample());
         save(&path, &kept).unwrap();
         let loaded = load(&path).unwrap();
-        assert_eq!(format!("{loaded:?}"), format!("{kept:?}"));
+        assert_eq!(lines(&loaded), lines(&kept));
+    }
+
+    #[test]
+    fn a_state_past_one_part_streams_back_whole() {
+        // Wide and long-named: more than a megabyte, names across parts.
+        let files = (0..40_000)
+            .map(|index| {
+                let mut file = leaf(
+                    &format!("{index:08}-{}", "n".repeat(index % 40)),
+                    NodeKind::File,
+                    index as u64,
+                );
+                file.inode = Some((VOLUME, index as u64 + 1));
+                file
+            })
+            .collect();
+        let kept = state(Tree::from_draft(
+            dir("r", vec![dir("wide", files)]),
+            Metric::Bytes,
+        ));
+        let bytes = encoded(&kept).unwrap();
+        assert!(bytes.len() > PART);
+        assert_eq!(lines(&decoded(&bytes).unwrap()), lines(&kept));
     }
 
     #[test]
@@ -578,9 +802,10 @@ mod tests {
         // A directory the save makes: an elevated one refuses any other.
         let dir = temp.path().join("walk");
         let path = dir.join("walk.bin");
-        save(&path, &state(Node::directory("old"))).unwrap();
+        let old = Tree::from_draft(Draft::directory("old"), Metric::Bytes);
+        save(&path, &state(old)).unwrap();
         save(&path, &state(sample())).unwrap();
-        assert_eq!(&*load(&path).unwrap().tree.name, "C:\\");
+        assert_eq!(load(&path).unwrap().tree.root().name(), "C:\\");
         let names: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -596,120 +821,114 @@ mod tests {
 
     #[test]
     fn any_damaged_byte_or_torn_end_is_refused() {
-        let bytes = encode(&state(sample())).unwrap();
-        assert!(decode(&bytes).is_some());
+        let bytes = encoded(&state(sample())).unwrap();
+        assert!(decoded(&bytes).is_some());
         for at in 0..bytes.len() {
             let mut damaged = bytes.clone();
             damaged[at] ^= 0x10;
-            assert!(decode(&damaged).is_none(), "byte {at}");
+            assert!(decoded(&damaged).is_none(), "byte {at}");
         }
         for len in 0..bytes.len() {
-            assert!(decode(&bytes[..len]).is_none(), "length {len}");
+            assert!(decoded(&bytes[..len]).is_none(), "length {len}");
         }
     }
 
     #[test]
     fn a_checksummed_file_with_trailing_bytes_is_refused() {
-        let mut bytes = encode(&state(sample())).unwrap();
+        let mut bytes = encoded(&state(sample())).unwrap();
         bytes.push(0);
         reseal(&mut bytes);
-        assert!(decode(&bytes).is_none());
+        assert!(decoded(&bytes).is_none());
     }
 
     #[test]
     fn unknown_flags_and_classes_are_refused_even_when_checksummed() {
-        let bytes = encode(&state(sample())).unwrap();
+        let bytes = encoded(&state(sample())).unwrap();
         let root = body_at(&bytes);
         for (at, value) in [
-            (root, 0x10),              // an unknown tag bit
+            (root, 0x10 | DIRECTORY),  // an unknown tag bit
             (root + 1, 9),             // no such category
             (root + 1, (10 << 4) | 8), // no such reason
         ] {
             let mut forged = bytes.clone();
             forged[at] = value;
             reseal(&mut forged);
-            assert!(decode(&forged).is_none(), "{at}: {value:#x}");
+            assert!(decoded(&forged).is_none(), "{at}: {value:#x}");
         }
     }
 
     #[test]
     fn counts_that_do_not_add_up_are_refused() {
-        let bytes = encode(&state(Node::directory("r"))).unwrap();
-        // The root's child count is its last byte.
+        let empty = Tree::from_draft(Draft::directory("r"), Metric::Bytes);
+        let bytes = encoded(&state(empty)).unwrap();
+        // The root's child count is just before its one-letter name and
+        // that name's length.
         let mut forged = bytes.clone();
-        *forged.last_mut().unwrap() = 1;
+        let count_at = forged.len() - 3;
+        forged[count_at] = 1;
         reseal(&mut forged);
-        assert!(decode(&forged).is_none());
+        assert!(decoded(&forged).is_none());
         for nodes in [0, 2, MOST_NODES + 1] {
             let mut forged = bytes.clone();
-            forged[NODE_COUNT_AT..HEADER]
+            forged[NODE_COUNT_AT..NODE_COUNT_AT + 8]
                 .copy_from_slice(&u64::to_le_bytes(nodes));
             reseal(&mut forged);
-            assert!(decode(&forged).is_none(), "{nodes} nodes");
+            assert!(decoded(&forged).is_none(), "{nodes} nodes");
         }
         let mut forged = bytes;
         forged[64..72].copy_from_slice(&u64::MAX.to_le_bytes());
         reseal(&mut forged);
-        assert!(decode(&forged).is_none());
+        assert!(decoded(&forged).is_none());
     }
 
     #[test]
     fn names_that_are_not_one_component_are_neither_kept_nor_loaded() {
-        let mut root = Node::directory("r");
-        root.children.push(leaf("ab", NodeKind::File, 1));
-        let bytes = encode(&state(root.clone())).unwrap();
+        let named = |name: &str| {
+            state(Tree::from_draft(
+                dir("r", vec![leaf(name, NodeKind::File, 1)]),
+                Metric::Bytes,
+            ))
+        };
+        let bytes = encoded(&named("ab")).unwrap();
         let at = bytes.windows(2).rposition(|pair| pair == b"ab").unwrap();
         for bad in ["..", "a/", "a\0", "C:", "a:"] {
             let mut forged = bytes.clone();
             forged[at..at + 2].copy_from_slice(bad.as_bytes());
             reseal(&mut forged);
-            assert!(decode(&forged).is_none(), "{bad:?}");
-            root.children[0].name = bad.into();
-            assert!(encode(&state(root.clone())).is_err(), "{bad:?}");
+            assert!(decoded(&forged).is_none(), "{bad:?}");
+            assert!(encoded(&named(bad)).is_err(), "{bad:?}");
         }
         let mut forged = bytes;
         forged[at] = 0xFF;
         reseal(&mut forged);
-        assert!(decode(&forged).is_none(), "not UTF-8");
+        assert!(decoded(&forged).is_none(), "not UTF-8");
         for name in ["", "."] {
-            root.children[0].name = name.into();
-            assert!(encode(&state(root.clone())).is_err(), "{name:?}");
+            assert!(encoded(&named(name)).is_err(), "{name:?}");
         }
     }
 
     #[test]
     fn depth_is_bounded_on_both_sides() {
-        fn chain(depth: usize) -> Node {
-            let mut node = Node::directory("d");
+        fn chain(depth: usize) -> Tree {
+            let mut node = Draft::directory("d");
             for _ in 0..depth {
-                let mut parent = Node::directory("d");
-                parent.children.push(node);
-                node = parent;
+                node = dir("d", vec![node]);
             }
-            node
+            Tree::from_draft(node, Metric::Bytes)
         }
-        let deepest = encode(&state(chain(MOST_DEPTH))).unwrap();
-        assert_eq!(decode(&deepest).unwrap().tree.depth() as usize, MOST_DEPTH);
-        assert!(encode(&state(chain(MOST_DEPTH + 1))).is_err());
+        let deepest = encoded(&state(chain(MOST_DEPTH))).unwrap();
+        let loaded = decoded(&deepest).unwrap();
+        assert_eq!(loaded.tree.root().depth() as usize, MOST_DEPTH);
+        assert!(encoded(&state(chain(MOST_DEPTH + 1))).is_err());
     }
 
     #[test]
-    fn only_settled_leaves_of_the_volume_are_kept() {
-        let breaks: [fn(&mut Node); 5] = [
-            |file| file.inode = Some((1, 9)),
-            |file| file.bytes += 1,
-            |file| file.files = 0,
-            |file| file.dirs = 1,
-            |file| file.children.push(Node::entry("g", NodeKind::File, 1)),
-        ];
-        for (index, bad) in breaks.into_iter().enumerate() {
+    fn only_identities_of_the_volume_are_kept() {
+        for (volume, kept) in [(VOLUME, true), (1, false)] {
             let mut file = leaf("f", NodeKind::File, 1);
-            file.inode = Some((VOLUME, 9));
-            let mut root = Node::directory("r");
-            root.children.push(file);
-            assert!(encode(&state(root.clone())).is_ok());
-            bad(&mut root.children[0]);
-            assert!(encode(&state(root)).is_err(), "case {index}");
+            file.inode = Some((volume, 9));
+            let tree = Tree::from_draft(dir("r", vec![file]), Metric::Bytes);
+            assert_eq!(encoded(&state(tree)).is_ok(), kept, "{volume}");
         }
     }
 }

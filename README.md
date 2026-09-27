@@ -255,9 +255,10 @@ escaped in the prompt, so it cannot pass for another path.
   a home directory. Symlinks are not followed.
 
 The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
-scope per root, a completion counter per directory so no directory is built
-before its last subdirectory lands, and one bottom-up pass that aggregates sizes
-and removes duplicate hardlinks.
+scope per root, and a completion counter per directory so no directory is built
+before its last subdirectory lands. Each directory then totals and orders its
+entries into a flat tree: a few dozen bytes an entry and its name, no heap
+block per file. A hardlinked file is charged under the first name listed.
 
 ## Switching volumes
 

@@ -134,13 +134,6 @@ impl Entry {
         &self.name
     }
 
-    /// The name, moved out: the tree keeps it, so nothing copies it. The
-    /// entry's other accessors keep working; `name`, `file_name` and
-    /// `path` do not.
-    pub fn take_name(&mut self) -> Box<str> {
-        std::mem::take(&mut self.name)
-    }
-
     pub const fn kind(&self) -> Kind {
         self.kind
     }

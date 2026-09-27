@@ -27,8 +27,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -38,7 +38,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::scan::{ScanOptions, ScanProgress};
-use crate::tree::{Node, PARALLEL_LEVELS, Seen, settle_directory};
+use crate::tree::{Seen, Tree};
 use crate::windows::{Aligned, drive_letter};
 
 mod flat;
@@ -174,13 +174,15 @@ struct Geometry {
 
 /// The tree under `root`, read from the volume's file table; `None` when
 /// the table cannot be read and the walk has to measure instead. The tree
-/// comes back finished: totalled, ordered and classified.
+/// comes back finished: totalled, ordered and classified. It is the tree
+/// kept for the next scan too, written by a thread of its own that shares
+/// it rather than a copy.
 pub fn scan(
     root: &Path,
     canonical: &Path,
     options: &ScanOptions,
     progress: &ScanProgress,
-) -> Option<io::Result<Node>> {
+) -> Option<io::Result<Arc<Tree>>> {
     // A followed link can lead off this volume, or back into it a second
     // time, and the table describes neither: the walk follows them.
     if options.follow_links {
@@ -203,87 +205,51 @@ pub fn scan(
     let resumed = file.as_deref().zip(journal).and_then(|(file, journal)| {
         snapshot::resume(&path, &volume, &geometry, journal, file, options)
     });
-    let tree = match resumed {
-        Some((flat, checkpoint)) => {
-            let tree = flat.tree(crate::scan::file_name(root), progress);
-            match (file, checkpoint) {
-                (Some(file), Some(checkpoint))
-                    if tree.is_ok() && !progress.is_cancelled() =>
-                {
-                    // What patches left behind is not worth keeping.
-                    snapshot::save_later(
-                        file,
-                        &geometry,
-                        options,
-                        checkpoint,
-                        move || {
-                            Some(if flat.has_garbage() {
-                                flat.compact()
-                            } else {
-                                flat
-                            })
-                        },
-                    );
-                }
-                // A few large lists, freed at once.
-                _ => drop(flat),
-            }
-            tree
+    let (tree, checkpoint) = match resumed {
+        Some((mut tree, checkpoint)) => {
+            tree.rename(crate::scan::file_name(root));
+            (Ok(Arc::new(tree)), checkpoint)
         }
-        None => whole(&path, &volume, &geometry, journal, options, progress)?
-            .map(|(mut node, (state, starts), checkpoint)| {
-                node.name = crate::scan::file_name(root);
-                crate::classify::classify(&mut node);
-                match (file, checkpoint) {
-                    (Some(file), Some(checkpoint))
-                        if !progress.is_cancelled() =>
-                    {
-                        let kept = options.clone();
-                        snapshot::save_later(
-                            file,
-                            &geometry,
-                            options,
-                            checkpoint,
-                            move || {
-                                // The same tree again, flat, from the
-                                // table: see `Table::build`.
-                                let progress = ScanProgress::default();
-                                let table =
-                                    Table::of(state, starts, &kept, &progress);
-                                let mut flat = table.build().ok()?;
-                                flat.classify(&[]);
-                                Some(flat)
-                            },
-                        );
-                    }
-                    // Millions of pieces, whose freeing would hold up the
-                    // tree. When no thread can be made, the closure is
-                    // dropped here instead, and they are freed in place.
-                    _ => {
-                        let _ = std::thread::Builder::new()
-                            .spawn(move || drop((state, starts)));
-                    }
+        None => {
+            match whole(&path, &volume, &geometry, journal, options, progress)?
+            {
+                Ok((mut tree, checkpoint)) => {
+                    tree.rename(crate::scan::file_name(root));
+                    crate::classify::classify(&mut tree);
+                    (Ok(Arc::new(tree)), checkpoint)
                 }
-                node
-            }),
+                Err(stop) => (Err(stop), None),
+            }
+        }
     };
+    if let (Ok(tree), Some(file), Some(checkpoint)) = (&tree, file, checkpoint)
+        && !progress.is_cancelled()
+    {
+        let tree = Arc::clone(tree);
+        snapshot::save_later(file, &geometry, options, checkpoint, move || {
+            // What patches left behind is not worth keeping.
+            Some(if tree.has_garbage() {
+                Arc::new(tree.compact())
+            } else {
+                tree
+            })
+        });
+    }
     match tree {
         Ok(_) | Err(Stop) if progress.is_cancelled() => Some(Err(cancelled())),
-        Ok(node) => Some(Ok(node)),
+        Ok(tree) => Some(Ok(tree)),
         Err(Stop) => None,
     }
 }
 
-/// What [`whole`] gives: the nodes, the table as it came, and the
-/// checkpoint.
-type Whole = (Node, (State, Vec<u32>), Option<Checkpoint>);
+/// What [`whole`] gives: the tree, not yet classified, and the checkpoint.
+type Whole = (Tree, Option<Checkpoint>);
 
 /// The directories changed just before a whole read, with the checkpoint.
 type Recent = (Checkpoint, Vec<u32>);
 
-/// The tree from a whole read of the table, as nodes not yet classified;
-/// with the table, from which the tree kept for the next scan is built,
-/// and with `journal`, where that scan can pick up. `None` when the table
+/// The tree from a whole read of the table, not yet classified, and with
+/// `journal`, where the next scan can pick up. `None` when the table
 /// cannot be read, and [`Stop`] when the read was cancelled or the table
 /// makes no tree.
 fn whole(
@@ -314,9 +280,11 @@ fn whole(
     });
     let starts = starts(&state.names, state.infos.len());
     let table = Table::of(state, starts, options, progress);
-    let nodes = table.nodes();
-    let owned = table.into_parts();
-    Some(nodes.map(|node| (node, owned, checkpoint)))
+    let tree = table.build();
+    // A few large lists, and nothing waits on their freeing.
+    let parts = table.into_parts();
+    let _ = std::thread::Builder::new().spawn(move || drop(parts));
+    Some(tree.map(|tree| (tree, checkpoint)))
 }
 
 /// Every used record of the table, read from the disk; with `journal`,
@@ -1234,65 +1202,6 @@ impl<'a> Table<'a> {
             _ => &[],
         }
     }
-
-    /// The tree beneath the root as nodes, totalled and ordered but not
-    /// classified: what a whole read hands over. What each entry becomes
-    /// is `flat`'s, which builds the same tree to keep.
-    fn nodes(&self) -> Result<Node, Stop> {
-        let sequence = self
-            .infos
-            .get(ROOT as usize)
-            .map_or(0, |info| info.sequence);
-        self.directory(ROOT, sequence, Box::default(), 0)
-    }
-
-    fn directory(
-        &self,
-        number: u32,
-        sequence: u16,
-        name: Box<str>,
-        depth: usize,
-    ) -> Result<Node, Stop> {
-        if depth >= MOST_LEVELS || self.progress.is_cancelled() {
-            return Err(Stop);
-        }
-        let descend = self.descend(depth);
-        let child = |entry: &Entry| {
-            Some(match self.entry(entry, sequence, descend).transpose()? {
-                Err(stop) => Err(stop),
-                Ok(flat::Built::File(item)) => {
-                    Ok(flat::leaf(&item, self.name(entry)))
-                }
-                Ok(flat::Built::Directory(child, child_sequence)) => self
-                    .directory(
-                        child,
-                        child_sequence,
-                        self.name(entry).into(),
-                        depth + 1,
-                    ),
-            })
-        };
-        let entries = self.entries(number);
-        // See `tree::PARALLEL_LEVELS`: parallel only near the top.
-        let children = if depth < PARALLEL_LEVELS {
-            entries
-                .par_iter()
-                .filter_map(child)
-                .collect::<Result<_, _>>()?
-        } else {
-            // Sized up front: nearly every entry becomes a child, and a
-            // list grown by doubling copies its nodes over and over.
-            let mut children = Vec::with_capacity(entries.len());
-            for node in entries.iter().filter_map(child) {
-                children.push(node?);
-            }
-            children
-        };
-        let mut node = Node::directory(name);
-        node.children = children;
-        settle_directory(&mut node, self.options.metric);
-        Ok(node)
-    }
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
@@ -1330,13 +1239,13 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 
     use super::*;
-    use crate::tree::NodeKind;
+    use crate::tree::{Node, NodeKind};
 
     /// The tree a table makes, the way a scan makes it.
-    fn tree_of(table: &Table<'_>) -> Result<Node, Stop> {
-        let mut node = table.nodes()?;
-        crate::classify::classify(&mut node);
-        Ok(node)
+    fn tree_of(table: &Table<'_>) -> Result<Tree, Stop> {
+        let mut tree = table.build()?;
+        crate::classify::classify(&mut tree);
+        Ok(tree)
     }
 
     const RECORD: usize = 1024;
@@ -1833,10 +1742,10 @@ mod tests {
         }
     }
 
-    fn paths(node: &Node, prefix: &str, out: &mut Vec<(String, NodeKind)>) {
-        for child in &node.children {
-            let path = format!("{prefix}{}", child.name);
-            out.push((path.clone(), child.kind));
+    fn paths(node: Node<'_>, prefix: &str, out: &mut Vec<(String, NodeKind)>) {
+        for child in node.children() {
+            let path = format!("{prefix}{}", child.name());
+            out.push((path.clone(), child.kind()));
             paths(child, &format!("{path}/"), out);
         }
     }
@@ -1933,7 +1842,7 @@ mod tests {
                 panic!("the table is not cut short");
             };
             let mut found = Vec::new();
-            paths(&root, "", &mut found);
+            paths(root.root(), "", &mut found);
             found.sort_by(|left, right| left.0.cmp(&right.0));
             let kind = |path: &str| match path {
                 "link" => NodeKind::Symlink,
@@ -1946,9 +1855,12 @@ mod tests {
                 .collect();
             assert_eq!(found, expected, "include_hidden {include_hidden}");
 
-            // Only a file with a second name needs its identity kept.
-            let inode = |name: &str| root.child_named(name).unwrap().inode;
-            assert_eq!(inode("linked.txt"), Some((0, 31)));
+            // Only a file with a second name needs its identity kept: its
+            // record, and the sequence number the record had.
+            let inode = |name: &str| {
+                root.root().child_named(name).and_then(Node::inode)
+            };
+            assert_eq!(inode("linked.txt"), Some((0, flat::reference(31, 1))));
             assert_eq!(inode("visible.txt"), None);
         }
     }
