@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Ioctl::{
 use super::flat::{Dir, Flat, Fresh, Item, NONE};
 use super::{
     ATTRIBUTE_LIST, Entry, Geometry, Info, Parsed, REFERENCE, ReadExact as _,
-    attributes, open_volume, parse_fixed, u16_at, u32_at, u64_at,
+    attributes, contents, open_volume, parse_fixed, u16_at, u32_at, u64_at,
 };
 use crate::scan::ScanOptions;
 use crate::tree::Metric;
@@ -178,7 +178,8 @@ fn read_again(
     }
     Some(vec![(bases, out)])
 }
-/// What each record re-read holds.
+/// What each record re-read holds, its extension records' part added as
+/// `merge` adds it.
 fn fresh(lists: &Lists) -> FxHashMap<u32, Fresh> {
     let mut fresh: FxHashMap<u32, Fresh> = lists
         .iter()
@@ -209,13 +210,42 @@ fn fresh(lists: &Lists) -> FxHashMap<u32, Fresh> {
                     .push((entry.parent, entry.parent_sequence, name));
             }
         }
+        // A name or size in an extension record left behind by a file
+        // whose record has since been reused is not this one's.
+        for (entry, sequence) in &out.extra_names {
+            if let Some(record) = fresh.get_mut(&entry.child)
+                && record.info.sequence == *sequence
+            {
+                record.info.names = record.info.names.saturating_add(1);
+                let name = text(out, entry);
+                record
+                    .names
+                    .push((entry.parent, entry.parent_sequence, name));
+            }
+        }
+        for &(number, sequence, apparent, allocated, tag) in &out.extra {
+            let Some(record) = fresh.get_mut(&number) else {
+                continue;
+            };
+            let info = &mut record.info;
+            if info.sequence != sequence {
+                continue;
+            }
+            info.allocated = info.allocated.saturating_add(allocated);
+            if let Some(apparent) = apparent {
+                info.apparent = apparent;
+            }
+            if info.reparse_tag == 0 {
+                info.reparse_tag = tag;
+            }
+        }
     }
     fresh
 }
 
-/// Parse file `number` as NTFS holds it now into `out`: its base record's
-/// facts, or `None` when the record is free or is itself another file's
-/// extension, which its base file carries.
+/// Parse file `number` as NTFS holds it now, its extension records too,
+/// into `out`: its base record's facts, or `None` when the record is free
+/// or is itself another file's extension, which its base file carries.
 fn reparse(
     volume: &File,
     geometry: &Geometry,
@@ -235,9 +265,42 @@ fn reparse(
     if !info.in_use {
         return Ok(None);
     }
-    // A file spread over extension records is for a whole read.
     if attributes(&base).any(|attribute| attribute.kind == ATTRIBUTE_LIST) {
-        return Err(io::Error::other("an attribute list"));
+        let list = contents(
+            volume,
+            geometry,
+            std::slice::from_ref(&base),
+            ATTRIBUTE_LIST,
+        )
+        .ok_or_else(|| io::Error::other("unreadable attribute list"))?;
+        let mut others = Vec::new();
+        let mut at = 0;
+        while let (Some(length), Some(reference)) =
+            (u16_at(&list, at + 4), u64_at(&list, at + 0x10))
+        {
+            if let Ok(other) = u32::try_from(reference & REFERENCE)
+                && other != number
+                && !others.contains(&other)
+            {
+                others.push(other);
+            }
+            if length == 0 {
+                break;
+            }
+            at += usize::from(length);
+        }
+        for other in others {
+            let Some(record) = fetch(volume, geometry, other, buffer)? else {
+                continue;
+            };
+            // Only an extension of this file adds to it; `merge` checks its
+            // sequence against the base's.
+            if u64_at(&record, 0x20).unwrap_or(0) & REFERENCE
+                == u64::from(number)
+            {
+                parse_fixed(&record, other, chunk, out, &mut Info::default());
+            }
+        }
     }
     Ok(Some(info))
 }
