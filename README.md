@@ -316,9 +316,10 @@ The same program, with Windows' answers to the questions above:
   `-l`, whose links the table does not follow. disktree flushes the volume
   after its own removals so the rescan shows them; changes other programs
   made seconds before may not show yet.
-  The finished tree that read made is kept in `%LOCALAPPDATA%\disktree`
-  (about 280 MB for that drive), and the next launch or rescan starts from
-  it: NTFS's change journal names every file changed since, only those are
+  The finished tree that read made is kept under
+  `%LOCALAPPDATA%\disktree\admin` (about 280 MB for that drive),
+  and the next launch or rescan starts from it: NTFS's change journal
+  names every file changed since, and only those are
   read again, from NTFS itself rather than the disk, and only the folders
   holding them, and those above, are totalled, ordered and classified
   again. On the same drive a launch took about 0.4 s and half the CPU of
@@ -328,8 +329,9 @@ The same program, with Windows' answers to the questions above:
   differ from the kept tree's, when a folder whose contents the tree never
   held comes into view (a cloud folder made local), or a day after the
   last whole read.
-  Without admin rights, an NTFS folder walk keeps a separate
-  `walk-*.bin` tree snapshot beside the MFT cache. The next launch reads
+  An NTFS folder walk keeps a separate `walk-*.bin` tree snapshot:
+  directly under `%LOCALAPPDATA%\disktree` without admin rights,
+  or in its `admin` subdirectory when elevated. The next launch reads
   the unprivileged change journal, lists changed directories and all
   cached hardlink aliases, and updates only the changed ancestor totals.
   New or moved-in directories are walked. Corrupt caches, changed root or
@@ -345,6 +347,13 @@ The same program, with Windows' answers to the questions above:
   Hardlink names can report different stale directory-listing allocations,
   so a fresh parallel walk can also assign a different byte count to the
   same file depending on which name it charges first.
+  An elevated scan keeps its caches only in that `admin` subdirectory,
+  which it makes owned by Administrators, with a protected ACL that
+  grants access to Administrators and SYSTEM alone, and it writes and
+  renames them through the directory's handle, so a link planted above
+  it cannot send them elsewhere. It refuses a directory or file there
+  that fails that check or is a link, and scans afresh; it never reads
+  the caches a scan without admin rights keeps beside it.
   On a whole NTFS drive without `-l`, or once Windows refuses the walk a
   folder, the side panel offers **Restart as Administrator**, which reopens
   the same folder and options through the UAC prompt; during a widening
