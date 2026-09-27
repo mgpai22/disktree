@@ -328,8 +328,8 @@ The same program, with Windows' answers to the questions above:
   names every file changed since, and only those are
   read again, from NTFS itself rather than the disk, and only the folders
   holding them, and those above, are totalled, ordered and classified
-  again. On the same drive a launch took about 0.4 s and half the CPU of
-  the previous release's 0.9 s. The whole table is read again when the
+  again. On the same drive a launch took about 0.4 s and a quarter of the
+  CPU of a whole read's 3.8 s. The whole table is read again when the
   journal no longer reaches back that far (it holds a few hours of a busy
   disk), when more than 100,000 files changed, when the scan options
   differ from the kept tree's, when a folder whose contents the tree never
