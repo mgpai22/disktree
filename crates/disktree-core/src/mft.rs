@@ -42,8 +42,8 @@ use crate::windows::{Aligned, drive_letter};
 mod flat;
 mod snapshot;
 
-use snapshot::Checkpoint;
 pub use snapshot::wait_for_saved;
+use snapshot::{Checkpoint, Journal, State};
 
 /// Most bytes read per call: large enough that the disk streams, small
 /// enough that many reads are outstanding at once.
@@ -207,37 +207,29 @@ pub fn scan(
             progress,
         );
     }
-    // Where the journal stands before the read: the next scan picks up
-    // there.
-    let checkpoint = journal.map(Checkpoint::before);
-    let (runs, bitmap) = table_layout(&volume, &geometry)?;
-    let reads = plan_reads(
-        &runs,
-        &bitmap,
-        &geometry,
-        GAP_BYTES / geometry.record as u64,
-    );
-    let mut infos = table(&reads, geometry.record);
-    let parsed = read_records(
-        &path,
-        geometry.record,
-        &reads,
-        &mut infos,
-        options.apparent_size,
-        progress,
-    )?;
+    let (mut state, checkpoint) =
+        read_whole(&path, &volume, &geometry, journal, options, progress)?;
     if progress.is_cancelled() {
         return Some(Err(cancelled()));
     }
-
-    let (mut names, texts) = merge(parsed, &mut infos);
-    if progress.is_cancelled() {
-        return Some(Err(cancelled()));
-    }
-    if !is_root_directory(&infos) {
+    if !is_root_directory(&state.infos) {
         return None;
     }
-    names.par_sort_unstable_by_key(|name| name.parent);
+    state.names.par_sort_unstable_by_key(|name| name.parent);
+    let checkpoint = checkpoint.map(|(checkpoint, recent)| {
+        // A directory changed just before the read can be on the disk as
+        // it was, or not at all, and what is in it would then find no
+        // place in the tree the next scan starts from. Read again from
+        // NTFS, which has them as they are; their files are read again on
+        // the next scan, with the rest of what changed.
+        let _ = snapshot::reread(&path, &geometry, &mut state, &recent);
+        checkpoint
+    });
+    let State {
+        infos,
+        names,
+        texts,
+    } = state;
     let starts = starts(&names, infos.len());
     let table = Table {
         infos,
@@ -282,6 +274,56 @@ pub fn scan(
     let _ = std::thread::Builder::new()
         .spawn(move || drop((infos, names, texts, starts)));
     finished(tree, progress)
+}
+
+/// The directories changed just before a whole read, with the checkpoint.
+type Recent = (Checkpoint, Vec<u32>);
+
+/// Every used record of the table, read from the disk; with `journal`,
+/// also where the next scan can pick up from, and the directories changed
+/// just before the read.
+fn read_whole(
+    path: &str,
+    volume: &File,
+    geometry: &Geometry,
+    journal: Option<Journal>,
+    options: &ScanOptions,
+    progress: &ScanProgress,
+) -> Option<(State, Option<Recent>)> {
+    let (runs, bitmap) = table_layout(volume, geometry)?;
+    let reads = plan_reads(
+        &runs,
+        &bitmap,
+        geometry,
+        GAP_BYTES / geometry.record as u64,
+    );
+    let mut infos = table(&reads, geometry.record);
+    // The journal, tens of megabytes read through NTFS, on a thread of its
+    // own while the table is on the disk.
+    let (parsed, checkpoint) = std::thread::scope(|scope| {
+        let checkpoint = journal.map(|journal| {
+            scope.spawn(move || snapshot::after_whole_read(volume, journal))
+        });
+        let parsed = read_records(
+            path,
+            geometry.record,
+            &reads,
+            &mut infos,
+            options.apparent_size,
+            progress,
+        );
+        let checkpoint = checkpoint.and_then(|thread| thread.join().ok()?);
+        (parsed, checkpoint)
+    });
+    let (names, texts) = merge(parsed?, &mut infos);
+    Some((
+        State {
+            infos,
+            names,
+            texts,
+        },
+        checkpoint,
+    ))
 }
 
 /// What a scan gives for `tree`: `None` when the walk has to measure
@@ -1323,6 +1365,116 @@ mod tests {
         assert_eq!(listed, ["current", "second"]);
         // Nor is the stale name counted as a link.
         assert_eq!(infos[0x5A].names, 2);
+    }
+
+    /// A file of `size` bytes named `names`, at sequence `sequence`.
+    fn file(sequence: u16, names: &[(u32, &str)], size: u64) -> Vec<u8> {
+        let mut attributes: Vec<Vec<u8>> = names
+            .iter()
+            .map(|&(parent, text)| name(parent, text, 1))
+            .collect();
+        attributes.push(non_resident(DATA, size.next_multiple_of(4096), size));
+        let mut bytes = record(IN_USE, 0, &attributes);
+        bytes[0x10..0x12].copy_from_slice(&sequence.to_le_bytes());
+        bytes
+    }
+
+    /// Every record read the way a whole read of the table does.
+    fn read_all(records: &[(u32, Vec<u8>)]) -> State {
+        let mut infos = vec![Info::default(); 64];
+        let mut out = Parsed::default();
+        for (number, bytes) in records {
+            let mut bytes = bytes.clone();
+            let slot = &mut infos[*number as usize];
+            parse_record(&mut bytes, *number, 0, &mut out, slot);
+        }
+        let (mut names, texts) = merge(vec![out], &mut infos);
+        names.sort_by_key(|entry| entry.parent);
+        State {
+            infos,
+            names,
+            texts,
+        }
+    }
+
+    /// `(parent, child, name, size)` for every name, in order.
+    fn listing(state: &State) -> Vec<(u32, u32, String, u64)> {
+        let mut listed: Vec<_> = state
+            .names
+            .iter()
+            .map(|entry| {
+                let at = entry.at as usize;
+                let text = &state.texts[entry.chunk as usize]
+                    [at..at + usize::from(entry.len)];
+                let info = state.infos[entry.child as usize];
+                (entry.parent, entry.child, text.to_owned(), info.apparent)
+            })
+            .collect();
+        listed.sort();
+        listed
+    }
+
+    #[test]
+    fn re_reading_the_changed_files_gives_what_a_whole_read_would() {
+        let dir = |sequence: u16| {
+            let mut bytes =
+                record(IN_USE | IS_DIRECTORY, 0, &[name(5, "dir", 1)]);
+            bytes[0x10..0x12].copy_from_slice(&sequence.to_le_bytes());
+            bytes
+        };
+        let before = [
+            (30, dir(2)),
+            (31, file(1, &[(30, "a.txt")], 100)),
+            (32, file(1, &[(30, "b.txt"), (5, "b-link.txt")], 200)),
+            (33, file(1, &[(5, "gone.txt")], 300)),
+            (40, file(1, &[(30, "kept.txt")], 400)),
+        ];
+        // 31 is renamed and grows, 32 loses a link, 33 is deleted and 34
+        // made; 40 is untouched.
+        let after = [
+            (30, dir(2)),
+            (31, file(1, &[(30, "a2.txt")], 150)),
+            (32, file(1, &[(30, "b.txt")], 200)),
+            (34, file(1, &[(30, "new.txt")], 50)),
+            (40, file(1, &[(30, "kept.txt")], 400)),
+        ];
+        let mut state = read_all(&before);
+        // Re-read as NTFS hands records over, update sequence undone, in
+        // two lists as two threads would.
+        let changed = [31, 32, 33, 34];
+        let lists = changed
+            .chunks(2)
+            .enumerate()
+            .map(|(chunk, numbers)| {
+                let mut out = Parsed::default();
+                let mut bases = Vec::new();
+                for number in numbers {
+                    let Some((_, bytes)) =
+                        after.iter().find(|(n, _)| n == number)
+                    else {
+                        continue;
+                    };
+                    let mut bytes = bytes.clone();
+                    fixup(&mut bytes).expect("fixed up");
+                    let mut info = Info::default();
+                    parse_fixed(
+                        &bytes,
+                        *number,
+                        chunk as u32,
+                        &mut out,
+                        &mut info,
+                    );
+                    bases.push((*number, info));
+                }
+                (bases, out)
+            })
+            .collect();
+        snapshot::apply(&mut state, &changed, lists).expect("applied");
+
+        assert_eq!(listing(&state), listing(&read_all(&after)));
+        assert!(state.names.is_sorted_by_key(|entry| entry.parent));
+        assert!(!state.infos[33].in_use);
+        assert_eq!(state.infos[32].names, 1, "no longer a hardlink");
     }
 
     #[test]

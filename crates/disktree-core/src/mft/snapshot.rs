@@ -11,24 +11,35 @@
 //! of another format, volume, record size or scan options, or one that
 //! fails its checksum or is not a tree, a journal that has since dropped
 //! the changes wanted, or changes the kept tree cannot take in.
+//!
+//! Two kinds of change the journal alone would miss are handled apart. A
+//! file still open for writing grows with no new journal entry until it is
+//! closed, so a file whose last entry is not a close is read again on
+//! every scan until one is. And the disk lags NTFS by the records it has
+//! not yet written back: after a whole read, the directories changed in the
+//! minutes before it are read again at once, so their entries find them,
+//! and the files on the next scan.
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::System::Ioctl::{
     FSCTL_GET_NTFS_FILE_RECORD, FSCTL_QUERY_USN_JOURNAL,
-    FSCTL_READ_USN_JOURNAL, USN_REASON_FILE_CREATE,
+    FSCTL_READ_USN_JOURNAL, USN_REASON_CLOSE, USN_REASON_FILE_CREATE,
 };
 
 use super::flat::{Dir, Flat, Fresh, Item, NONE};
 use super::{
     ATTRIBUTE_LIST, Entry, Geometry, Info, Parsed, REFERENCE, ReadExact as _,
-    attributes, contents, open_volume, parse_fixed, u16_at, u32_at, u64_at,
+    attributes, contents, merge, open_volume, parse_fixed, u16_at, u32_at,
+    u64_at,
 };
 use crate::scan::ScanOptions;
 use crate::tree::Metric;
@@ -37,6 +48,12 @@ use crate::windows::control;
 /// Bumped whenever what a kept tree holds changes, so one kept by an
 /// older build is read again rather than trusted.
 const MAGIC: [u8; 8] = *b"dttree\x00\x02";
+
+/// How long before a whole read a change may still be only in memory: its
+/// file is read again from NTFS on the next scan. Of 64,000 files the
+/// journal named on a busy `C:\`, the disk and NTFS disagreed on 5 changed
+/// in the last 5 s, one 48 s old, and none older.
+const LAG_TICKS: i64 = 2 * 60 * 10_000_000;
 
 /// Bytes of the journal read per call.
 const JOURNAL_BUFFER: usize = 1 << 20;
@@ -50,20 +67,22 @@ pub(super) struct Journal {
     next: u64,
 }
 
-/// Where the next scan picks up the journal.
+/// Where the next scan picks up the journal, and the files it reads again
+/// whatever the journal says.
 pub(super) struct Checkpoint {
     journal: u64,
     next: u64,
+    /// Files last seen open for writing: read again until closed.
+    open: Vec<u32>,
+    /// `open`, and after a whole read the files changed just before it.
+    revisit: Vec<u32>,
 }
 
-impl Checkpoint {
-    /// Before a whole read that `journal` is at.
-    pub(super) const fn before(journal: Journal) -> Self {
-        Self {
-            journal: journal.id,
-            next: journal.next,
-        }
-    }
+/// What one read of the table found, as `merge` leaves it.
+pub(super) struct State {
+    pub infos: Vec<Info>,
+    pub names: Vec<Entry>,
+    pub texts: Vec<String>,
 }
 
 /// The file kept for `letter` in `dir`.
@@ -82,11 +101,16 @@ pub(super) fn query(volume: &File) -> Option<Journal> {
     })
 }
 
-/// What the journal says of a file since some point: whether any entry
-/// made it (a directory made since holds only what the journal names).
+/// What the journal says of a file since some point: when its last entry
+/// was, whether that closed it, whether any made it (a directory made
+/// since holds only what the journal names), and whether it is a
+/// directory.
 #[derive(Clone, Copy, Default)]
 struct Change {
+    closed: bool,
+    stamp: i64,
     created: bool,
+    directory: bool,
 }
 
 /// Every file the journal names from `from` on, and where it ended.
@@ -115,7 +139,8 @@ fn changes(
         while at < out.len() {
             let length = u32_at(out, at)? as usize;
             // Version 2 records, which a version 0 request gets on NTFS:
-            // 64-bit file references at 8, reasons at 40.
+            // 64-bit file references at 8, stamp at 32, reasons at 40,
+            // attributes at 52.
             if length < 60 || u16_at(out, at + 4)? != 2 {
                 return None;
             }
@@ -123,7 +148,11 @@ fn changes(
             let number = u32::try_from(u64_at(record, 8)? & REFERENCE).ok()?;
             let reason = u32_at(record, 40)?;
             let change: &mut Change = files.entry(number).or_default();
+            change.closed = reason & USN_REASON_CLOSE != 0;
+            change.stamp = u64_at(record, 32)?.cast_signed();
             change.created |= reason & USN_REASON_FILE_CREATE != 0;
+            change.directory =
+                u32_at(record, 52)? & FILE_ATTRIBUTE_DIRECTORY != 0;
             at += length;
         }
         if out.len() <= 8 || next <= at_usn {
@@ -131,6 +160,48 @@ fn changes(
         }
         at_usn = next;
     }
+}
+
+/// Now as a `FILETIME`: 100 ns ticks since 1601.
+fn now_ticks() -> i64 {
+    const EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() / 100);
+    i64::try_from(since).map_or(i64::MAX, |ticks| ticks + EPOCH_TICKS)
+}
+
+/// The checkpoint after a whole read that started at `journal.next`: read
+/// on its own thread while the table is. With it, the directories changed
+/// just before the read, which the disk may not have yet.
+pub(super) fn after_whole_read(
+    volume: &File,
+    journal: Journal,
+) -> Option<(Checkpoint, Vec<u32>)> {
+    let started = now_ticks();
+    let (files, _) = changes(volume, journal, journal.first)?;
+    let mut open = Vec::new();
+    let mut revisit = Vec::new();
+    let mut directories = Vec::new();
+    for (&number, change) in &files {
+        if !change.closed {
+            open.push(number);
+        }
+        if !change.closed || change.stamp >= started - LAG_TICKS {
+            revisit.push(number);
+            if change.directory {
+                directories.push(number);
+            }
+        }
+    }
+    directories.sort_unstable();
+    let checkpoint = Checkpoint {
+        journal: journal.id,
+        next: journal.next,
+        open,
+        revisit,
+    };
+    Some((checkpoint, directories))
 }
 
 /// The last scan's tree brought up to date; `None` when a whole read is
@@ -146,7 +217,9 @@ pub(super) fn resume(
     let (mut flat, checkpoint) = load(file, geometry, journal, key(options))?;
     let (files, _) = changes(volume, journal, checkpoint.next)?;
     let mut numbers: Vec<u32> = files.keys().copied().collect();
+    numbers.extend(&checkpoint.revisit);
     numbers.sort_unstable();
+    numbers.dedup();
     let fresh = fresh(&read_again(path, geometry, &numbers)?);
     let created =
         |number| files.get(&number).is_some_and(|change| change.created);
@@ -178,6 +251,18 @@ fn read_again(
     }
     Some(vec![(bases, out)])
 }
+
+/// Replace what `state` holds for each of `numbers` by what its record
+/// holds now.
+pub(super) fn reread(
+    path: &str,
+    geometry: &Geometry,
+    state: &mut State,
+    numbers: &[u32],
+) -> Option<()> {
+    apply(state, numbers, read_again(path, geometry, numbers)?)
+}
+
 /// What each record re-read holds, its extension records' part added as
 /// `merge` adds it.
 fn fresh(lists: &Lists) -> FxHashMap<u32, Fresh> {
@@ -241,6 +326,63 @@ fn fresh(lists: &Lists) -> FxHashMap<u32, Fresh> {
         }
     }
     fresh
+}
+
+/// Drop everything `state` holds for `numbers`, then add what re-reading
+/// them found: per list, the base records' facts and the rest parsed, the
+/// list's place its chunk number.
+pub(super) fn apply(
+    state: &mut State,
+    numbers: &[u32],
+    lists: Vec<(Vec<(u32, Info)>, Parsed)>,
+) -> Option<()> {
+    let State {
+        infos,
+        names,
+        texts,
+    } = state;
+    let last = numbers.iter().copied().max().unwrap_or(0);
+    let len = infos.len().max(last as usize + 1);
+    infos.resize(len, Info::default());
+    let mut changed = vec![false; len];
+    for &number in numbers {
+        changed[number as usize] = true;
+        infos[number as usize] = Info::default();
+    }
+    let mut parsed = Vec::with_capacity(lists.len());
+    for (bases, out) in lists {
+        for (number, info) in bases {
+            infos[number as usize] = info;
+        }
+        parsed.push(out);
+    }
+    let first = u32::try_from(texts.len()).ok()?;
+    let (mut added, added_texts) = merge(parsed, infos);
+    texts.extend(added_texts);
+    // The kept names are in parent order, and sorting the few new ones and
+    // merging them in keeps it: sorting all again costs a tenth of a
+    // second. In place, from the back: a new list of millions of names
+    // costs more to fault in than to fill.
+    added.sort_unstable_by_key(|name| name.parent);
+    names.retain(|name| {
+        !changed.get(name.child as usize).copied().unwrap_or(false)
+    });
+    let mut kept = names.len();
+    names.resize(kept + added.len(), Entry::EMPTY);
+    for slot in (0..names.len()).rev() {
+        let Some(new) = added.last() else { break };
+        if kept > 0 && names[kept - 1].parent > new.parent {
+            kept -= 1;
+            names[slot] = names[kept];
+        } else {
+            names[slot] = Entry {
+                chunk: new.chunk + first,
+                ..*new
+            };
+            added.pop();
+        }
+    }
+    Some(())
 }
 
 /// Parse file `number` as NTFS holds it now, its extension records too,
@@ -380,11 +522,12 @@ fn key(options: &ScanOptions) -> u64 {
 }
 
 /// Header: magic, serial, record size, journal, next, the options, and
-/// the counts of directories, entries and name bytes, then the checksum of
-/// all that follows.
-const HEADER: usize = 8 * 10;
+/// the counts of directories, entries, name bytes, open and revisit files,
+/// then the checksum of all that follows.
+const HEADER: usize = 8 * 12;
 const DIR: usize = 52;
 const ITEM: usize = 30;
+const NUMBER: usize = 4;
 
 /// Bytes per write, and per stretch of the checksum. Two writes of a
 /// hundred megabytes and more took a table 427 ms to write; in pieces of a
@@ -395,6 +538,7 @@ const PIECE: usize = 1 << 20;
 const DIRS: u64 = 1;
 const ITEMS: u64 = 2;
 const TEXT: u64 = 3;
+const NUMBERS: u64 = 4;
 
 fn encode_dir(dir: &Dir, out: &mut [u8]) {
     out[0..4].copy_from_slice(&dir.record.to_le_bytes());
@@ -459,6 +603,12 @@ fn save(
     tree: &Flat,
     checkpoint: &Checkpoint,
 ) -> io::Result<()> {
+    let numbers: Vec<u32> = checkpoint
+        .open
+        .iter()
+        .chain(&checkpoint.revisit)
+        .copied()
+        .collect();
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -471,7 +621,8 @@ fn save(
     let length = HEADER
         + tree.dirs.len() * DIR
         + tree.items.len() * ITEM
-        + tree.text.len();
+        + tree.text.len()
+        + numbers.len() * NUMBER;
     out.set_len(length as u64)?;
     // The header goes in last, once the checksum is known.
     out.write_all(&[0; HEADER])?;
@@ -490,6 +641,14 @@ fn save(
         sum ^= checksum(TEXT, index, part);
         out.write_all(part)?;
     }
+    sum ^= write_region(
+        &mut out,
+        &numbers,
+        NUMBER,
+        NUMBERS,
+        |number, out| out.copy_from_slice(&number.to_le_bytes()),
+        &mut piece,
+    )?;
     let mut header = Vec::with_capacity(HEADER);
     header.extend_from_slice(&MAGIC);
     for value in [
@@ -501,6 +660,8 @@ fn save(
         tree.dirs.len() as u64,
         tree.items.len() as u64,
         tree.text.len() as u64,
+        checkpoint.open.len() as u64,
+        checkpoint.revisit.len() as u64,
         sum,
     ] {
         header.extend_from_slice(&value.to_le_bytes());
@@ -547,17 +708,20 @@ fn load(
     Some((flat, kept.checkpoint))
 }
 
-/// A kept tree's header, read and checked before its body.
+/// A kept tree's header and lists of files, read and checked before its
+/// body.
 struct Kept {
     dirs: usize,
     items: usize,
     text: usize,
-    /// The checksum the whole file must have.
+    /// The checksum the whole file must have, and what its lists of files
+    /// make of it.
     sum: u64,
+    numbers: u64,
     checkpoint: Checkpoint,
 }
 
-/// The header of the tree kept in `file`: see [`load`].
+/// The header and lists of files of the tree kept in `file`: see [`load`].
 fn open(
     file: &Path,
     geometry: &Geometry,
@@ -583,13 +747,17 @@ fn open(
         return None;
     }
     let (dirs, items, text) = (count(5)?, count(6)?, count(7)?);
+    let (open, revisit) = (count(8)?, count(9)?);
     // Sizes checked against the file before anything is allocated for
     // them: a corrupt count must not ask for terabytes.
-    let length = dirs
+    let numbers = open.checked_add(revisit)?;
+    let body = dirs
         .checked_mul(DIR)?
         .checked_add(items.checked_mul(ITEM)?)?
-        .checked_add(text)?
-        .checked_add(HEADER)?;
+        .checked_add(text)?;
+    let length = HEADER
+        .checked_add(body)?
+        .checked_add(numbers.checked_mul(NUMBER)?)?;
     if length != usize::try_from(input.metadata().ok()?.len()).ok()?
         || [dirs, items, text]
             .iter()
@@ -597,14 +765,27 @@ fn open(
     {
         return None;
     }
+    let (numbers, sum) = read_region(
+        file,
+        HEADER + body,
+        numbers,
+        NUMBER,
+        NUMBERS,
+        0,
+        |bytes| u32_at(bytes, 0).unwrap_or(0),
+    )?;
+    let (open, revisit) = numbers.split_at(open);
     Some(Kept {
         dirs,
         items,
         text,
-        sum: value(8)?,
+        sum: value(10)?,
+        numbers: sum,
         checkpoint: Checkpoint {
             journal: journal.id,
             next,
+            open: open.to_vec(),
+            revisit: revisit.to_vec(),
         },
     })
 }
@@ -647,7 +828,7 @@ fn body(file: &Path, kept: &Kept) -> Option<Flat> {
         })
         .collect::<Option<Vec<u64>>>()?
         .into_iter()
-        .fold(0, |sum, piece| sum ^ piece);
+        .fold(kept.numbers, |sum, piece| sum ^ piece);
     let flat = Flat { dirs, items, text };
     (found == kept.sum && flat.is_valid()).then_some(flat)
 }
@@ -777,6 +958,8 @@ mod tests {
         let checkpoint = Checkpoint {
             journal: 0xABCD,
             next: 123_456,
+            open: vec![30],
+            revisit: vec![31],
         };
         let dir = tempfile::TempDir::new().expect("tempdir");
         let file = file(dir.path(), 'C');
@@ -791,7 +974,10 @@ mod tests {
             (&loaded.dirs, &loaded.items, &loaded.text),
             (&saved.dirs, &saved.items, &saved.text)
         );
-        assert_eq!((kept.journal, kept.next), (0xABCD, 123_456));
+        assert_eq!(
+            (kept.journal, kept.next, kept.open, kept.revisit),
+            (0xABCD, 123_456, vec![30], vec![31])
+        );
 
         // Another volume's, a table of another record size, or a scan
         // with other options is not this one's.
