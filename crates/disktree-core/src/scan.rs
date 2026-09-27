@@ -326,7 +326,7 @@ impl WalkContext {
             Ok(listing) => listing,
             Err(error) => {
                 self.progress.record_error(&entry.entry_path(dir), &error);
-                return Classified::Skipped;
+                return Classified::Unreadable;
             }
         };
 
@@ -351,7 +351,7 @@ impl WalkContext {
             Ok(facts) => self.leaf(entry.take_name(), kind, &facts),
             Err(error) => {
                 self.progress.record_error(&entry.entry_path(dir), &error);
-                Classified::Skipped
+                Classified::Unreadable
             }
         }
     }
@@ -407,7 +407,7 @@ impl WalkContext {
                 }
                 (Err(error), _) => {
                     self.progress.record_error(&path, error);
-                    return Classified::Skipped;
+                    return Classified::Unreadable;
                 }
                 _ => {}
             }
@@ -434,7 +434,7 @@ impl WalkContext {
                 }
                 Err(error) => {
                     self.progress.record_error(path, &error);
-                    Classified::Skipped
+                    Classified::Unreadable
                 }
             };
         }
@@ -690,8 +690,10 @@ enum Classified {
     Subdirectory { path: PathBuf, name: Box<str> },
     /// A leaf that contributes size.
     Entry(Node),
-    /// Filtered out, unreadable, or a symlink we chose not to follow.
+    /// Intentionally left out by the scan policy.
     Skipped,
+    /// Missing facts must be retried even without another journal record.
+    Unreadable,
 }
 
 /// One directory being walked, plus the counter that decides when it is done.
@@ -936,6 +938,9 @@ fn walk<'scope>(
                                 leaves.push(node);
                             }
                             Classified::Skipped => {}
+                            Classified::Unreadable => {
+                                dir.read_error.store(true, Ordering::Relaxed);
+                            }
                         }
                         if tally.files + tally.dirs >= TALLY_EVERY {
                             tally.flush(&context.progress);
@@ -943,6 +948,7 @@ fn walk<'scope>(
                     }
                     Err(error) => {
                         context.progress.record_error(&dir.path, &error);
+                        dir.read_error.store(true, Ordering::Relaxed);
                     }
                 }
             }
