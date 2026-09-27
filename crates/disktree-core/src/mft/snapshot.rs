@@ -272,7 +272,7 @@ pub(super) fn resume(
             let lists = read_again(path, geometry, &numbers)?;
             Some((files, next, numbers, lists))
         });
-        (body(file, &kept), journaled.join().ok().flatten())
+        (body(&kept), journaled.join().ok().flatten())
     });
     let (mut flat, (files, next, numbers, lists)) = (flat?, journaled?);
     let fresh = fresh(&lists);
@@ -887,13 +887,14 @@ fn load(
     key: u64,
 ) -> Option<(Flat, Checkpoint)> {
     let kept = open(file, geometry, journal, key)?;
-    let flat = body(file, &kept)?;
+    let flat = body(&kept)?;
     Some((flat, kept.checkpoint))
 }
 
 /// A kept tree's header and lists of files, read and checked before its
 /// body.
 struct Kept {
+    input: File,
     dirs: usize,
     items: usize,
     text: usize,
@@ -956,13 +957,15 @@ fn open(
     }
     let at = HEADER + body;
     let (numbers, sum) =
-        read_region(file, at, numbers, NUMBER, NUMBERS, 0, |bytes| {
+        read_region(&input, at, numbers, NUMBER, NUMBERS, 0, |bytes| {
             u32_at(bytes, 0).unwrap_or(0)
         })?;
     let at = at + numbers.len() * NUMBER;
-    let (big, big_sum) = read_region(file, at, big, BIG, BIGS, 0, decode_big)?;
+    let (big, big_sum) =
+        read_region(&input, at, big, BIG, BIGS, 0, decode_big)?;
     let (open, revisit) = numbers.split_at(open);
     Some(Kept {
+        input,
         dirs,
         items,
         text,
@@ -980,12 +983,12 @@ fn open(
 }
 
 /// The tree itself, if it matches its checksum and is a tree.
-fn body(file: &Path, kept: &Kept) -> Option<Flat> {
+fn body(kept: &Kept) -> Option<Flat> {
     let mut at = HEADER;
     // Room to grow: a patch appends, and growing a list of millions past
     // its capacity copies it whole.
     let (dirs, mut found) = read_region(
-        file,
+        &kept.input,
         at,
         kept.dirs,
         DIR,
@@ -995,7 +998,7 @@ fn body(file: &Path, kept: &Kept) -> Option<Flat> {
     )?;
     at += kept.dirs * DIR;
     let (items, sum) = read_region(
-        file,
+        &kept.input,
         at,
         kept.items,
         ITEM,
@@ -1012,7 +1015,10 @@ fn body(file: &Path, kept: &Kept) -> Option<Flat> {
         .enumerate()
         .map(|(index, piece)| {
             let offset = (at + index * PIECE) as u64;
-            File::open(file).ok()?.seek_read_exact(piece, offset).ok()?;
+            crate::windows::cache_reopen(&kept.input)
+                .ok()?
+                .seek_read_exact(piece, offset)
+                .ok()?;
             Some(checksum(TEXT, index, piece))
         })
         .collect::<Option<Vec<u64>>>()?
@@ -1027,7 +1033,7 @@ fn body(file: &Path, kept: &Kept) -> Option<Flat> {
 /// decoded as they come: no copy of the file's bytes is kept. With their
 /// checksum.
 fn read_region<T: Clone + Default + Send + Sync>(
-    file: &Path,
+    file: &File,
     offset: usize,
     count: usize,
     size: usize,
@@ -1042,7 +1048,7 @@ fn read_region<T: Clone + Default + Send + Sync>(
         .par_chunks_mut(per)
         .enumerate()
         .map_init(
-            || (File::open(file).ok(), Vec::new()),
+            || (crate::windows::cache_reopen(file).ok(), Vec::new()),
             |(input, bytes), (index, records)| {
                 bytes.resize(records.len() * size, 0);
                 let offset = (offset + index * per * size) as u64;

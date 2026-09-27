@@ -34,11 +34,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
     FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FileIdExtdDirectoryInfo, FileIdType, FileStandardInfo, FindFirstVolumeW,
-    FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FileIdExtdDirectoryInfo, FileIdType, FileStandardInfo,
+    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
     GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
-    GetVolumePathNamesForVolumeNameW, OpenFileById, SYNCHRONIZE,
+    GetVolumePathNamesForVolumeNameW, OpenFileById, ReOpenFile, SYNCHRONIZE,
 };
 
 use crate::space::SpaceInfo;
@@ -1003,6 +1003,27 @@ fn standard_sizes(file: &File) -> io::Result<(u64, u64)> {
                 .cast_signed(),
         ),
     ))
+}
+
+/// Another handle on the file `original` has open, for reads at offsets of
+/// their own: one synchronous handle serializes its reads. Made from the
+/// handle, not the path, so it is the file already checked.
+pub fn cache_reopen(original: &File) -> io::Result<File> {
+    // SAFETY: original is a live file handle; ReOpenFile returns an owned
+    // handle to the same stream, not a path that could be swapped.
+    let handle = unsafe {
+        ReOpenFile(
+            original.as_raw_handle(),
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ReOpenFile returned a new handle owned by this File alone.
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 /// Bytes aligned to a page, for reads that bypass the file cache: those
