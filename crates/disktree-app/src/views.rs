@@ -15,7 +15,7 @@ use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
     FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Rems, RenderImage,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Rems, RenderImage,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window,
     anchored, deferred, div, img, pattern_slash, point, px, relative,
 };
@@ -131,12 +131,24 @@ pub fn root(
             )
             .with_priority(3),
         );
+        // Where the snap below puts the menu's left edge: each flyout
+        // picks its side of the panel before it from it.
+        let width = size::CONTEXT_MENU.to_pixels(window.rem_size());
+        let viewport = window.viewport_size().width;
+        let left = if menu.position.x + width > viewport {
+            viewport - width - px(8.)
+        } else {
+            menu.position.x
+        };
+        let left = if left < px(0.) { px(8.) } else { left };
         root = root.child(
             deferred(
                 anchored()
                     .position(menu.position)
                     .snap_to_window_with_margin(px(8.))
-                    .child(context_panel(app, &menu, 0, &theme, window, cx)),
+                    .child(context_panel(
+                        app, &menu, 0, left, &theme, window, cx,
+                    )),
             )
             .with_priority(4),
         );
@@ -169,11 +181,13 @@ struct RowLook {
 
 /// What can be done with one tile, at the pointer, the way a file manager's
 /// right-click menu offers it: level `depth` of it, the menu itself or a
-/// flyout, with the flyout open from one of its rows drawn beside that row.
+/// flyout, with its left edge at `left` in the window, and with the flyout
+/// open from one of its rows drawn beside that row.
 fn context_panel(
     app: &Disktree,
     menu: &ContextMenu,
     depth: usize,
+    left: Pixels,
     theme: &Theme,
     window: &Window,
     cx: &Context<'_, Disktree>,
@@ -327,22 +341,32 @@ fn context_panel(
                     .child(if look.submenu { "›" } else { look.key }),
             );
         if highlighted && menu.highlighted.len() > depth + 1 {
-            // From the row's corner: beside the panel's right edge, its
-            // first row level with this one; on the left of the row
-            // instead when the window has no room on the right.
+            // Beside the panel's right edge, level with this row; on its
+            // left instead when the window has no room on the right. Not
+            // anchored's own corner switch, which drops the offset and so
+            // lays the flyout over the menu; the snap only moves it up off
+            // the window's bottom.
+            let width = size::CONTEXT_MENU.to_pixels(rem);
             let inset = space::XS.to_pixels(rem) + px(1.);
-            let beside =
-                point(size::CONTEXT_MENU.to_pixels(rem) - inset, -inset);
+            let room = window.viewport_size().width - px(8.);
+            let right = left + width * 2. <= room || left - width < px(8.);
+            let beside = if right { left + width } else { left - width };
             item = item.child(
                 div().absolute().top_0().left_0().child(
-                    deferred(anchored().offset(beside).child(context_panel(
-                        app,
-                        menu,
-                        depth + 1,
-                        theme,
-                        window,
-                        cx,
-                    )))
+                    deferred(
+                        anchored()
+                            .offset(point(beside - left - inset, px(0.)))
+                            .snap_to_window_with_margin(px(8.))
+                            .child(context_panel(
+                                app,
+                                menu,
+                                depth + 1,
+                                beside,
+                                theme,
+                                window,
+                                cx,
+                            )),
+                    )
                     .with_priority(5 + depth),
                 ),
             );

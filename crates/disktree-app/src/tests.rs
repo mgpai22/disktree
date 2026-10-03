@@ -1907,12 +1907,28 @@ fn explorer_rows_open_flyouts_and_skip_what_cannot_be_picked(
     press(cx, "down");
     press(cx, "right");
     assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]), "not Off");
+    // Beside the menu's right edge, level with its row, as there is room.
+    let menu = cx.debug_bounds("context-menu").expect("the menu is drawn");
+    let item = cx.debug_bounds("context-item-8").expect("its row");
+    let flyout = cx.debug_bounds("context-flyout-1").expect("and its flyout");
+    assert!(
+        flyout.left() >= menu.right() - px(1.)
+            && (flyout.top() - item.top()).abs() <= px(1.),
+        "beside its row: {menu:?} {item:?} {flyout:?}"
+    );
+    // In the window's bottom right corner it opens on the menu's left and
+    // moves up to stay inside, still beside the menu, never over it.
+    update(&view, cx, |app, _| {
+        if let Some(menu) = &mut app.context_menu {
+            menu.position = gpui_kit::point(px(1400.), px(900.));
+        }
+    });
+    draw(cx);
     let menu = cx.debug_bounds("context-menu").expect("the menu is drawn");
     let flyout = cx.debug_bounds("context-flyout-1").expect("and its flyout");
     assert!(
-        flyout.left() >= menu.right() - px(8.)
-            || flyout.right() <= menu.left() + px(8.),
-        "beside the menu, not over it: {menu:?} {flyout:?}"
+        flyout.right() <= menu.left() + px(1.) && flyout.bottom() <= px(900.),
+        "beside the menu, inside the window: {menu:?} {flyout:?}"
     );
     press(cx, "up");
     assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]));
