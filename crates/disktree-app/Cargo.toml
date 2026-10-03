@@ -20,9 +20,23 @@ disktree-core = { workspace = true }
 anyhow = { workspace = true }
 dunce = "1.0.5"
 rustc-hash = { workspace = true }
+# Watches a folder after a shell verb or a terminal may have changed it.
+notify = "8"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+# The window's HWND, for the Explorer menu; gpui-pre implements it.
+raw-window-handle = "0.6"
+# The frame type GPUI draws Explorer's row icons from; gpui-pre has it.
+image = { version = "0.25", default-features = false }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 # The window harness: it lets the tests draw a real frame and press real keys.

@@ -16,15 +16,25 @@ mod appearance;
 mod git;
 mod marks;
 mod palette;
+#[cfg(windows)]
+mod shell_menu;
 mod state;
+mod terminal;
 #[cfg(test)]
 mod tests;
 mod treemap_view;
 mod ui;
 mod views;
+mod watch;
 mod widgets;
 
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::{
+    io::IsTerminal as _,
+    os::unix::process::CommandExt as _,
+    process::{Command, Stdio},
+};
 
 use anyhow::{Context as _, Result};
 use disktree_core::scan::ScanOptions;
@@ -73,7 +83,31 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let args = parse_args()?;
+    let args = parse_args(std::env::args_os().skip(1))?;
+
+    // When the app executable is reached through the command-line symlink,
+    // cmux sends SIGTERM to its foreground process group as AppKit takes
+    // focus. Spawn once into a separate group before AppKit starts. Restrict
+    // this to interactive cmux sessions so scripts retain normal foreground
+    // lifetime; the marker prevents the child from spawning recursively.
+    #[cfg(target_os = "macos")]
+    if std::io::stdin().is_terminal()
+        && std::env::var_os("CMUX_SURFACE_ID").is_some()
+        && std::env::var_os("DISKTREE_CMUX_DETACHED").is_none()
+    {
+        Command::new(std::env::current_exe().context("find disktree")?)
+            .args(std::env::args_os().skip(1))
+            .env("DISKTREE_CMUX_DETACHED", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // Zero makes the child the leader of a new process group.
+            .process_group(0)
+            .spawn()
+            .context("start disktree")?;
+        return Ok(());
+    }
+
     let root = args.root.clone();
     let depth = args.depth;
     let title_root = root.clone();
@@ -150,15 +184,25 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn parse_args() -> Result<Args> {
+/// Read the command line, program name already skipped.
+fn parse_args(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<Args> {
     let mut root: Option<PathBuf> = None;
     let mut options = ScanOptions::default();
     let mut depth = 3_u32;
     let mut disk = false;
-    let mut args = std::env::args().skip(1);
+    // `std::env::args` panics on a name that is not Unicode, and a path is
+    // any name: a restart as administrator hands the root back exactly as
+    // it was, so the caller passes `args_os`.
+    let text = |value: Option<std::ffi::OsString>, need: &str| {
+        value
+            .and_then(|value| value.into_string().ok())
+            .with_context(|| need.to_owned())
+    };
 
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        match arg.to_str().unwrap_or_default() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -172,7 +216,7 @@ fn parse_args() -> Result<Args> {
             "-X" | "--cross-filesystems" => options.one_filesystem = false,
             "-D" | "--disk" => disk = true,
             "-d" | "--depth" => {
-                let value = args.next().context("--depth needs a number")?;
+                let value = text(args.next(), "--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
                 anyhow::ensure!(
                     (1..=6).contains(&depth),
@@ -180,7 +224,7 @@ fn parse_args() -> Result<Args> {
                 );
             }
             "--metric" => {
-                let value = args.next().context("--metric needs a value")?;
+                let value = text(args.next(), "--metric needs a value")?;
                 options.metric = match value.as_str() {
                     "files" => disktree_core::tree::Metric::Files,
                     "bytes" | "size" => disktree_core::tree::Metric::Bytes,
@@ -195,9 +239,9 @@ fn parse_args() -> Result<Args> {
             other if other.starts_with('-') => {
                 anyhow::bail!("unknown option {other}\n\n{USAGE}");
             }
-            path => {
+            _ => {
                 anyhow::ensure!(root.is_none(), "only one path can be scanned");
-                root = Some(PathBuf::from(path));
+                root = Some(PathBuf::from(arg));
             }
         }
     }
@@ -224,6 +268,10 @@ fn parse_args() -> Result<Args> {
     let metadata = std::fs::metadata(&root)
         .with_context(|| format!("cannot read {}", root.display()))?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());
+    // Windows walks and MFT reads keep separate snapshots here, so the
+    // next launch can use the journal instead of measuring everything.
+    options.cache = std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join("disktree"));
 
     Ok(Args {
         root,

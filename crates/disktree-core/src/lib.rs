@@ -10,6 +10,8 @@ pub mod classify;
 pub mod export;
 pub mod filter;
 pub mod insights;
+#[cfg(windows)]
+mod mft;
 pub mod removal;
 pub mod scan;
 pub mod size;

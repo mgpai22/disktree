@@ -5,10 +5,12 @@
 //! that panics while painting, a binding that never fires, a removal that
 //! reports success without removing anything.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use disktree_core::removal::RemovalMode;
 use disktree_core::scan::{ScanOptions, scan};
+use disktree_core::space::{SpaceInfo, Volume};
+use disktree_core::tree::Node;
 use disktree_core::treemap::Tile;
 use gpui_kit::{
     Bounds, Context, Entity, Pixels, Point, TestAppContext, VisualTestContext,
@@ -150,7 +152,7 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
             app.layout().map(<[Tile]>::len).unwrap_or_default(),
             app.selected.is_some(),
             app.tree().is_some_and(|tree| {
-                tree.children.iter().any(|c| c.name.starts_with('.'))
+                tree.children().any(|c| c.name().starts_with('.'))
             }),
         )
     });
@@ -173,7 +175,7 @@ fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
     let (selected, name) = read(&view, cx, |app| {
         (
             app.selected.clone(),
-            app.node_at(&[0]).map(|node| node.name.to_string()),
+            app.node_at(&[0]).map(|node| node.name().to_string()),
         )
     });
     assert_eq!(selected, Some(vec![0]));
@@ -216,9 +218,8 @@ fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
         let junk = app
             .tree()
             .and_then(|tree| {
-                tree.children
-                    .iter()
-                    .position(|child| &*child.name == "junk")
+                tree.children()
+                    .position(|child| child.name() == "junk")
                     .map(|index| vec![index])
             })
             .expect("the junk directory");
@@ -396,7 +397,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
             tiles
                 .iter()
                 .filter_map(|tile| app.node_at(tile.crumbs()))
-                .map(|node| node.name.to_string())
+                .map(|node| node.name().to_string())
                 .collect::<Vec<_>>()
         })
     };
@@ -410,9 +411,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
     let (count, applied, keep_filtered) = read(&view, cx, |app| {
         let matches = app.matches.as_deref().expect("matching as it is typed");
         let keep = app.tree().and_then(|tree| {
-            tree.children
-                .iter()
-                .position(|child| &*child.name == "keep")
+            tree.children().position(|child| child.name() == "keep")
         });
         (
             matches.count,
@@ -464,6 +463,112 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
     assert!(read(&view, cx, |app| app.show_help));
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.show_help));
+}
+
+#[gpui_kit::test]
+fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // The picker lists volumes and draws them without panicking; Escape
+    // leaves the scan where it was.
+    press(cx, "v");
+    assert!(read(&view, cx, |app| app.volumes_open));
+    draw(cx);
+    assert!(cx.debug_bounds("disktree-root").is_some());
+    let before = read(&view, cx, |app| app.root_path.clone());
+    press(cx, "down");
+    press(cx, "up");
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), before);
+}
+
+/// Enter must reach the picker even when its dialog owns keyboard focus.
+#[gpui_kit::test]
+fn enter_in_the_focused_volume_picker_scans_the_selected_root(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let target = temp.path().join("junk");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.volumes = vec![disktree_core::space::Volume {
+            point: target.clone(),
+            device: None,
+            space: None,
+        }];
+        app.volume_highlight = 0;
+        app.volumes_open = true;
+    });
+    let focus = read(&view, cx, |app| app.confirm_focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    assert!(!read(&view, cx, Disktree::can_start_over));
+    press(cx, "enter");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), target);
+    finish_scan(&view, cx);
+    assert!(read(&view, cx, |app| app.tree().is_some()));
+}
+
+#[gpui_kit::test]
+fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Fixed rows, so this is about where the popup lands and not about which
+    // disks the machine running the test happens to have.
+    update(&view, cx, |app, cx| {
+        app.volumes = vec![
+            Volume {
+                point: PathBuf::from("/one"),
+                device: Some("/dev/one".into()),
+                space: Some(SpaceInfo {
+                    total: 1_000,
+                    free: 500,
+                    available: 400,
+                }),
+            },
+            Volume {
+                point: PathBuf::from("/two"),
+                device: None,
+                space: None,
+            },
+        ];
+        app.volumes_open = true;
+        cx.notify();
+    });
+    draw(cx);
+
+    let viewport = cx.update(|window, _| window.viewport_size());
+    let rows = cx.debug_bounds("volume-rows").expect("the rows are drawn");
+    let centre = rows.center();
+    assert!(
+        (centre.x - viewport.width / 2.0).abs() < px(4.),
+        "the popup is not centred across: {centre:?} in {viewport:?}"
+    );
+    assert!(
+        (centre.y - viewport.height / 2.0).abs() < px(150.),
+        "the popup is not centred down: {centre:?} in {viewport:?}"
+    );
+
+    // The wrapper that centres the popup must not swallow the backdrop's
+    // clicks: a click in the corner, outside the popup, still closes it.
+    cx.simulate_click(
+        gpui_kit::point(px(4.), px(4.)),
+        gpui_kit::Modifiers::none(),
+    );
+    draw(cx);
+    assert!(
+        !read(&view, cx, |app| app.volumes_open),
+        "clicking outside the picker closes it"
+    );
 }
 
 #[gpui_kit::test]
@@ -723,9 +828,8 @@ fn interface_zoom_scales_the_rem_and_the_header_band(cx: &mut TestAppContext) {
 fn child_crumbs(app: &Disktree, parent: &[usize], name: &str) -> Vec<usize> {
     let node = app.node_at(parent).expect("the parent");
     let index = node
-        .children
-        .iter()
-        .position(|child| &*child.name == name)
+        .children()
+        .position(|child| child.name() == name)
         .unwrap_or_else(|| panic!("no {name}"));
     let mut crumbs = parent.to_vec();
     crumbs.push(index);
@@ -1012,8 +1116,10 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     let (view, cx) = view_over(&inner, cx);
     update(&view, cx, |app, _| {
         app.disk_root = Some(temp.path().to_path_buf());
+        // Stale on purpose: the wider root, a folder, must reset it.
+        app.file_table = true;
     });
-    let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
+    let before = read(&view, cx, |app| app.tree().map(Node::files));
 
     // The trail runs from the top of the filesystem — "/", or a drive such
     // as "C:\" — and the scanned root sits under its parents.
@@ -1039,14 +1145,18 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     assert!(read(&view, cx, |app| app.tree().is_some()));
     finish_scan(&view, cx);
     assert_eq!(read(&view, cx, |app| app.root_path.clone()), temp.path());
+    assert!(
+        !read(&view, cx, |app| app.file_table),
+        "the offer follows the root it widened to"
+    );
     let (reused, rest, selected) = read(&view, cx, |app| {
         let tree = app.tree().expect("the wider tree");
-        let junk = tree.child_named("junk").map(|node| node.files);
+        let junk = tree.child_named("junk").map(Node::files);
         let selected = app
             .selected
             .as_deref()
             .and_then(|crumbs| app.node_at(crumbs))
-            .map(|node| node.name.to_string());
+            .map(|node| node.name().to_string());
         (junk, tree.child_named("keep").is_some(), selected)
     });
     assert_eq!(reused, before, "junk was reused, not walked again");
@@ -1092,9 +1202,7 @@ fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     // Into junk, so the trail ends in a crumb that has siblings.
     let junk = read(&view, cx, |app| {
         app.tree()
-            .and_then(|tree| {
-                tree.children.iter().position(|c| &*c.name == "junk")
-            })
+            .and_then(|tree| tree.children().position(|c| c.name() == "junk"))
             .expect("junk")
     });
     update(&view, cx, |app, cx| app.go_to(vec![junk], cx));
@@ -1143,9 +1251,7 @@ fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     });
     let cache = read(&view, cx, |app| {
         app.tree()
-            .and_then(|tree| {
-                tree.children.iter().position(|c| &*c.name == ".cache")
-            })
+            .and_then(|tree| tree.children().position(|c| c.name() == ".cache"))
             .expect(".cache")
     });
     assert_eq!(crumbs, vec![cache], "went sideways into .cache");
@@ -1321,4 +1427,626 @@ fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
         read(&view, cx, |app| app.crumbs.clone()),
         Vec::<usize>::new()
     );
+}
+
+/// Regression: children are ordered by the metric, so switching between
+/// Size and Files reorders them. The directory on screen and the selection
+/// are found again by path, rather than following their old positions into
+/// a sibling.
+#[gpui_kit::test]
+fn switching_the_metric_keeps_the_directory_and_the_selection(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path();
+    // Largest by size, but fewest files: the two swap places.
+    std::fs::create_dir_all(root.join("big")).expect("mkdir");
+    std::fs::write(root.join("big/one.bin"), vec![b'x'; 500_000])
+        .expect("write");
+    std::fs::write(root.join("big/two.bin"), vec![b'x'; 1_000]).expect("write");
+    for index in 0..5 {
+        let file = root.join(format!("many/{index}.txt"));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, b"x").expect("write");
+    }
+    let (view, cx) = view_over(root, cx);
+    draw(cx);
+
+    update(&view, cx, |app, cx| {
+        let big = child_crumbs(app, &[], "big");
+        assert_eq!(big, vec![0], "largest first by size");
+        app.go_to(big.clone(), cx);
+        let one = child_crumbs(app, &big, "one.bin");
+        app.select(Some(one), cx);
+    });
+    draw(cx);
+
+    update(&view, cx, |app, cx| app.set_mode(1, cx));
+    draw(cx);
+    let (here, selected) = read(&view, cx, |app| {
+        (
+            app.current_path(),
+            app.selected
+                .as_deref()
+                .and_then(|crumbs| app.path_at(crumbs)),
+        )
+    });
+    assert_eq!(here, root.join("big"));
+    assert_eq!(selected, Some(root.join("big/one.bin")));
+
+    update(&view, cx, |app, cx| app.set_mode(0, cx));
+    draw(cx);
+    assert_eq!(read(&view, cx, Disktree::current_path), root.join("big"));
+}
+
+/// Escape stops a first scan. What the walk found so far is not shown as a
+/// tree, a late result is ignored, and `r` starts over.
+#[gpui_kit::test]
+fn escape_cancels_the_first_scan_and_r_starts_it_again(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let root = temp.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(move |_, cx| Disktree::new(root, options(), 3, cx));
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+
+    press(cx, "escape");
+    let (scanning, cancelled) = read(&view, cx, |app| {
+        (app.scan.is_some(), app.progress.cancelled)
+    });
+    assert!(!scanning, "the walk was dropped");
+    assert!(cancelled, "the panel can say it stopped");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let polling = update(&view, cx, |app, cx| app.poll_scan_once(epoch, cx));
+    assert!(!polling, "the old poller stops");
+    assert!(read(&view, cx, |app| app.tree().is_none()));
+    draw(cx);
+
+    press(cx, "r");
+    finish_scan(&view, cx);
+    assert!(read(&view, cx, |app| app.tree().is_some()));
+}
+
+/// Escape stops a widening scan and keeps the tree it started from.
+#[gpui_kit::test]
+fn escape_cancels_widening_and_keeps_the_tree_on_screen(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let inner = temp.path().join("junk");
+    let (view, cx) = view_over(&inner, cx);
+    update(&view, cx, |app, _| {
+        app.disk_root = Some(temp.path().to_path_buf());
+    });
+    let before = read(&view, cx, |app| app.tree().map(Node::files));
+
+    press(cx, "g");
+    assert!(read(&view, cx, |app| app.scan.is_some()));
+    press(cx, "escape");
+    let (scanning, root, scan_root, files) = read(&view, cx, |app| {
+        (
+            app.scan.is_some(),
+            app.root_path.clone(),
+            app.scan_root.clone(),
+            app.tree().map(Node::files),
+        )
+    });
+    assert!(!scanning);
+    assert_eq!(root, inner);
+    assert_eq!(scan_root, inner, "the trail stops showing a widening");
+    assert_eq!(files, before, "the tree on screen is unchanged");
+}
+
+/// The mouse's back and forward buttons retrace the same history as
+/// alt-arrows and the header buttons, and only on the explore screen.
+#[gpui_kit::test]
+fn mouse_side_buttons_go_back_and_forward(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, NavigationDirection};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+
+    let (junk, deeper) = update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        let deeper = child_crumbs(app, &junk, "deeper");
+        app.select(Some(junk.clone()), cx);
+        app.descend(cx);
+        app.select(Some(deeper.clone()), cx);
+        app.descend(cx);
+        (junk, deeper)
+    });
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    // Over the mosaic, buttons 8 and 9 step the history, as alt-arrows do.
+    let mosaic = cx.debug_bounds("treemap").expect("the mosaic is drawn");
+    let at = mosaic.center();
+    let press_button = |cx: &mut Window, button: MouseButton| {
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_mouse_down(at, button, Modifiers::none());
+        cx.simulate_mouse_up(at, button, Modifiers::none());
+        draw(cx);
+    };
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Back));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), junk);
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Forward));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    // On the review screen the same press changes nothing: the marked list
+    // is not somewhere the history can take you back to.
+    update(&view, cx, |app, cx| app.toggle_mark(&junk, cx));
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Back));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+}
+
+/// The restart as administrator reopens the same root and options: every
+/// flag it writes is one the command line reads back.
+#[test]
+fn restart_arguments_parse_back_to_the_same_scan() {
+    use disktree_core::tree::Metric;
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path().join("a folder");
+    std::fs::create_dir(&root).expect("mkdir");
+    let root = dunce::canonicalize(&root).expect("canonical root");
+    let changed = ScanOptions {
+        apparent_size: true,
+        follow_links: true,
+        include_hidden: false,
+        one_filesystem: false,
+        metric: Metric::Files,
+        ..ScanOptions::default()
+    };
+    for (options, depth) in [(changed, 5), (ScanOptions::default(), 1)] {
+        let args = crate::state::restart_args(&options, depth, &root);
+        let parsed = crate::parse_args(args.into_iter()).expect("parses");
+        assert_eq!(parsed.root, root);
+        assert_eq!(parsed.depth, depth);
+        let got = &parsed.options;
+        assert_eq!(
+            (
+                got.apparent_size,
+                got.follow_links,
+                got.include_hidden,
+                got.one_filesystem,
+                got.metric,
+            ),
+            (
+                options.apparent_size,
+                options.follow_links,
+                options.include_hidden,
+                options.one_filesystem,
+                options.metric,
+            )
+        );
+    }
+}
+
+/// The menu rows' debug selectors, which must outlive the test.
+const CONTEXT_ROWS: [&str; 5] = [
+    "context-item-0",
+    "context-item-1",
+    "context-item-2",
+    "context-item-3",
+    "context-item-4",
+];
+
+/// Where junk's name band is on screen: junk itself, not its children.
+fn junk_band(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+) -> (Vec<usize>, Point<Pixels>) {
+    update(view, cx, |app, _| {
+        let junk = child_crumbs(app, &[], "junk");
+        let band = app
+            .layout()
+            .and_then(|tiles| {
+                tiles.iter().find(|tile| tile.crumbs() == junk.as_slice())
+            })
+            .and_then(|tile| tile.header)
+            .expect("junk is drawn with a band");
+        let screen = app.view.project(band);
+        let origin = app.treemap_origin.get();
+        let at = Point::new(
+            origin.x + px(screen.x + screen.w / 2.0),
+            origin.y + px(screen.y + screen.h / 2.0),
+        );
+        (junk, at)
+    })
+}
+
+fn right_click(cx: &mut Window, at: Point<Pixels>) {
+    use gpui_kit::{Modifiers, MouseButton};
+    cx.simulate_mouse_move(at, None, Modifiers::none());
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+    draw(cx);
+}
+
+/// The row of the open menu that runs `action`.
+fn menu_row(
+    view: &Entity<Disktree>,
+    cx: &Window,
+    action: crate::state::MenuAction,
+) -> usize {
+    read(view, cx, |app| {
+        let menu = app.context_menu.as_ref().expect("the menu is open");
+        app.context_items(&menu.target)
+            .iter()
+            .position(|&item| item == action)
+            .expect("the menu lists it")
+    })
+}
+
+/// Run `action` from the open menu by clicking its drawn row.
+fn choose(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+    action: crate::state::MenuAction,
+) {
+    let row = menu_row(view, cx, action);
+    let bounds = cx
+        .debug_bounds(CONTEXT_ROWS[row])
+        .expect("the row is drawn");
+    cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+}
+
+#[gpui_kit::test]
+fn a_right_click_selects_the_tile_and_copies_its_path(cx: &mut TestAppContext) {
+    use crate::state::MenuAction;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+
+    let (junk, at) = junk_band(&view, cx);
+    right_click(cx, at);
+    let (target, selected) = read(&view, cx, |app| {
+        (
+            app.context_menu.as_ref().map(|menu| menu.target.clone()),
+            app.selected.clone(),
+        )
+    });
+    assert_eq!(target.as_ref(), Some(&junk));
+    assert_eq!(selected, Some(junk));
+    assert!(
+        cx.debug_bounds("context-menu").is_some(),
+        "the menu is drawn"
+    );
+
+    choose(&view, cx, MenuAction::CopyPath);
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("a path on the clipboard");
+    assert_eq!(PathBuf::from(copied), temp.path().join("junk"));
+    assert!(read(&view, cx, |app| app.context_menu.is_none()));
+}
+
+#[gpui_kit::test]
+fn the_menu_offers_open_only_where_it_goes_somewhere(cx: &mut TestAppContext) {
+    use crate::state::MenuAction;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let (folder, file, here) = read(&view, cx, |app| {
+        let junk = child_crumbs(app, &[], "junk");
+        let blob = child_crumbs(app, &junk, "blob.bin");
+        (
+            app.context_items(&junk),
+            app.context_items(&blob),
+            app.context_items(&app.crumbs),
+        )
+    });
+    assert_eq!(folder.first(), Some(&MenuAction::Open));
+    assert!(!file.contains(&MenuAction::Open), "a file is not entered");
+    assert!(!here.contains(&MenuAction::Open), "already on screen");
+    for items in [&folder, &file, &here] {
+        assert!(items.contains(&MenuAction::Mark));
+    }
+}
+
+#[gpui_kit::test]
+fn shift_f10_asks_for_the_selection_and_mark_toggles(cx: &mut TestAppContext) {
+    use crate::state::MenuAction;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let (junk, at) = junk_band(&view, cx);
+    right_click(cx, at);
+    press(cx, "escape");
+
+    for marked in [1, 0] {
+        press(cx, "shift-f10");
+        let target = read(&view, cx, |app| {
+            app.context_menu.as_ref().map(|menu| menu.target.clone())
+        });
+        assert_eq!(target.as_ref(), Some(&junk));
+        choose(&view, cx, MenuAction::Mark);
+        let marks = read(&view, cx, |app| app.marks.items().to_vec());
+        assert_eq!(marks.len(), marked);
+        assert!(read(&view, cx, |app| app.context_menu.is_none()));
+    }
+}
+
+#[gpui_kit::test]
+fn the_menu_marks_from_the_keyboard_and_closes_like_a_menu(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::MenuAction;
+    use gpui_kit::{Modifiers, MouseButton};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let (junk, at) = junk_band(&view, cx);
+
+    // Escape closes it, and nothing behind it acts.
+    right_click(cx, at);
+    press(cx, "escape");
+    let (open, selected) = read(&view, cx, |app| {
+        (app.context_menu.is_some(), app.selected.clone())
+    });
+    assert!(!open);
+    assert_eq!(selected, Some(junk.clone()), "escape went to the menu");
+
+    // A click outside closes it.
+    right_click(cx, at);
+    let corner = gpui_kit::point(px(4.), px(4.));
+    cx.simulate_mouse_down(corner, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(corner, MouseButton::Left, Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.context_menu.is_none()));
+
+    // Shift-F10 opens it for the selection; the arrows and Enter mark.
+    press(cx, "shift-f10");
+    let target = read(&view, cx, |app| {
+        app.context_menu.as_ref().map(|menu| menu.target.clone())
+    });
+    assert_eq!(target, Some(junk));
+    for _ in 0..menu_row(&view, cx, MenuAction::Mark) {
+        press(cx, "down");
+    }
+    press(cx, "enter");
+    let marked = read(&view, cx, |app| app.marks.items().to_vec());
+    assert_eq!(marked.len(), 1);
+    assert_eq!(marked[0].path, temp.path().join("junk"));
+    assert!(read(&view, cx, |app| app.context_menu.is_none()));
+}
+
+/// Explorer's rows as the menu draws them, made up so the test does not
+/// read this machine's shell extensions: a disabled row, separators, and a
+/// submenu whose flyout the keys and the pointer open and close.
+#[cfg(windows)]
+#[gpui_kit::test]
+fn explorer_rows_open_flyouts_and_skip_what_cannot_be_picked(
+    cx: &mut TestAppContext,
+) {
+    use crate::shell_menu::{ShellItem, ShellRow};
+    use gpui_kit::Modifiers;
+
+    let row = |id, label: &str, enabled, children: Option<Vec<ShellItem>>| {
+        ShellItem::Row(ShellRow {
+            id,
+            label: label.to_string(),
+            enabled,
+            checked: false,
+            default: false,
+            icon: None,
+            children: children.map(Into::into),
+        })
+    };
+    let highlighted = |view: &Entity<Disktree>, cx: &Window| {
+        read(view, cx, |app| {
+            app.context_menu
+                .as_ref()
+                .map(|menu| menu.highlighted.clone())
+        })
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let (_, at) = junk_band(&view, cx);
+    right_click(cx, at);
+    let own = update(&view, cx, |app, _| {
+        let menu = app.context_menu.as_ref().expect("the menu is open");
+        let own = app.context_items(&menu.target).len();
+        if let Some(menu) = &mut app.context_menu {
+            menu.shell_items = vec![
+                row(1, "Greyed", false, None),
+                ShellItem::Separator,
+                row(
+                    0,
+                    "Send to",
+                    true,
+                    Some(vec![
+                        row(2, "Off", false, None),
+                        row(3, "Zip", true, None),
+                    ]),
+                ),
+            ]
+            .into();
+        }
+        own
+    });
+    draw(cx);
+    // Five own rows for a folder: the separator after them is row 5, the
+    // greyed row 6, the next separator 7, "Send to" 8.
+    assert_eq!(own, 5);
+    let send_to = 8;
+
+    press(cx, "end");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to]));
+    press(cx, "up");
+    assert_eq!(highlighted(&view, cx), Some(vec![own - 1]), "skips 5-7");
+    press(cx, "down");
+    press(cx, "right");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]), "not Off");
+    // Beside the menu's right edge, level with its row, as there is room.
+    let menu = cx.debug_bounds("context-menu").expect("the menu is drawn");
+    let item = cx.debug_bounds("context-item-8").expect("its row");
+    let flyout = cx.debug_bounds("context-flyout-1").expect("and its flyout");
+    assert!(
+        flyout.left() >= menu.right() - px(1.)
+            && (flyout.top() - item.top()).abs() <= px(1.),
+        "beside its row: {menu:?} {item:?} {flyout:?}"
+    );
+    // In the window's bottom right corner it opens on the menu's left and
+    // moves up to stay inside, still beside the menu, never over it.
+    update(&view, cx, |app, _| {
+        if let Some(menu) = &mut app.context_menu {
+            menu.position = gpui_kit::point(px(1400.), px(900.));
+        }
+    });
+    draw(cx);
+    let menu = cx.debug_bounds("context-menu").expect("the menu is drawn");
+    let flyout = cx.debug_bounds("context-flyout-1").expect("and its flyout");
+    assert!(
+        flyout.right() <= menu.left() + px(1.) && flyout.bottom() <= px(900.),
+        "beside the menu, inside the window: {menu:?} {flyout:?}"
+    );
+    press(cx, "up");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]));
+    press(cx, "left");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to]));
+    assert!(cx.debug_bounds("context-flyout-1").is_none());
+    press(cx, "enter");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]));
+    press(cx, "escape");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to]));
+
+    // A greyed row takes no click, and the pointer opens the flyout.
+    let greyed = cx.debug_bounds("context-item-6").expect("drawn");
+    cx.simulate_click(greyed.center(), Modifiers::none());
+    draw(cx);
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to]));
+    let item = cx.debug_bounds("context-item-8").expect("drawn");
+    cx.simulate_mouse_move(item.center(), None, Modifiers::none());
+    draw(cx);
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]));
+    let zip = cx.debug_bounds("context-1-1").expect("the flyout's row");
+    cx.simulate_click(zip.center(), Modifiers::none());
+    draw(cx);
+    assert!(
+        read(&view, cx, |app| app.context_menu.is_none()),
+        "a pick closes the menu"
+    );
+}
+
+#[gpui_kit::test]
+fn a_right_click_on_the_merged_tail_is_for_the_folder_on_screen(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::treemap::TileKind;
+
+    cx.update(gpui_omarchy::init);
+    // More files than the layout draws one by one, of equal size, so the
+    // rest merge into a tile large enough to point at.
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let many = temp.path().join("many");
+    std::fs::create_dir(&many).expect("mkdir");
+    for index in 0..300 {
+        std::fs::write(many.join(format!("file-{index}.bin")), [b'x'; 4096])
+            .expect("write");
+    }
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let inside = update(&view, cx, |app, cx| {
+        let many = child_crumbs(app, &[], "many");
+        app.go_to(many.clone(), cx);
+        many
+    });
+    draw(cx);
+    let (at, selected) = update(&view, cx, |app, _| {
+        let tail = app
+            .layout()
+            .and_then(|tiles| {
+                tiles
+                    .iter()
+                    .find(|tile| matches!(tile.kind, TileKind::Others { .. }))
+                    .map(|tile| tile.rect)
+            })
+            .expect("the small files merge");
+        let screen = app.view.project(tail);
+        let origin = app.treemap_origin.get();
+        (
+            Point::new(
+                origin.x + px(screen.x + screen.w / 2.0),
+                origin.y + px(screen.y + screen.h / 2.0),
+            ),
+            app.selected.clone(),
+        )
+    });
+    right_click(cx, at);
+    let (target, after) = read(&view, cx, |app| {
+        (
+            app.context_menu.as_ref().map(|menu| menu.target.clone()),
+            app.selected.clone(),
+        )
+    });
+    assert_eq!(target, Some(inside));
+    assert_eq!(after, selected, "the merged tail is not a selection");
+}
+
+#[gpui_kit::test]
+fn refreshing_a_folder_shows_what_changed_on_disk(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let junk_bytes = |view: &Entity<Disktree>, cx: &Window| {
+        read(view, cx, |app| {
+            let junk = child_crumbs(app, &[], "junk");
+            app.node_at(&junk).map(Node::bytes).expect("junk")
+        })
+    };
+    let before = junk_bytes(&view, cx);
+    // Keep junk selected across the swap, by path.
+    update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        app.select(Some(junk), cx);
+    });
+    std::fs::write(temp.path().join("junk/new.bin"), vec![b'x'; 50_000])
+        .expect("write");
+    update(&view, cx, |app, cx| {
+        app.refresh_folder(temp.path().join("junk"), cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(junk_bytes(&view, cx), before + 50_000);
+    // junk outgrew .cache, so its crumbs moved: the selection follows it.
+    let names = read(&view, cx, |app| {
+        app.selected
+            .as_deref()
+            .and_then(|selected| app.node_at(selected))
+            .map(|node| node.name().to_string())
+            .expect("the selection is still there")
+    });
+    assert_eq!(names, "junk");
 }

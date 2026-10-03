@@ -113,9 +113,10 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
     for target in targets {
         let path = normalize(&target.path);
         let reason =
-            refuse(&path, &root, home.as_ref(), &mounts).or_else(|| {
-                linked(&path, &root, real_root.as_deref(), home.as_ref())
-            });
+            refuse(&path, &root, home.as_ref(), &mounts.points, &mounts.media)
+                .or_else(|| {
+                    linked(&path, &root, real_root.as_deref(), home.as_ref())
+                });
         if let Some(reason) = reason {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
@@ -364,6 +365,7 @@ fn refuse(
     root: &Path,
     home: Option<&Home>,
     mounts: &[PathBuf],
+    media: &[PathBuf],
 ) -> Option<String> {
     let key = guard_key(path);
     let root_key = guard_key(root);
@@ -400,12 +402,25 @@ fn refuse(
     if home_key.is_some_and(|home| home.starts_with(&key)) {
         return Some("it contains the home directory".into());
     }
+    // Elevated through another account's credentials, home is that admin's,
+    // and the user's own profile is just another folder; elevation opens
+    // every other profile too. So on Windows each directory in the profiles
+    // folder (`C:\Users\tobi`, `Public`, `Default`) is refused, taken from
+    // Windows and not from home, whose parent could be anything. What is
+    // inside a profile stays removable, as under one's own home.
+    if profiles_key().is_some_and(|profiles| is_profile(path, &key, profiles)) {
+        return Some("a user profile cannot be removed".into());
+    }
     // By spelling too: the Data volume's root keeps its name as a key, while
     // everything under it is keyed as under `/`.
     if !key.starts_with(&root_key) && !path.starts_with(root) {
         return Some("outside the scanned root".into());
     }
-    if let Some(system) = system_tree(&key, home_key) {
+    if let Some(system) = system_tree(&key, home_key)
+        && !(system == "/run"
+            && on_media(&key, mounts, media)
+            && fs::canonicalize(path).is_ok_and(|real| real == path))
+    {
         return Some(format!(
             "part of the system under {system}: {SYSTEM_TOOLS}"
         ));
@@ -415,7 +430,7 @@ fn refuse(
             "it contains {system}, which is part of the system"
         ));
     }
-    if is_mount_point(path) {
+    if mounts.contains(&key) || is_mount_point(path) {
         return Some(
             "a mount point: removing it would cross onto another filesystem"
                 .into(),
@@ -524,10 +539,81 @@ const fn identity(_path: &Path, _follow: bool) -> Option<(u64, u64)> {
 /// mount boundary whatever the table said.
 const MOUNTS_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Paths and safe media exceptions must come from the same snapshot.
+#[derive(Default)]
+struct MountTable {
+    points: Vec<PathBuf>,
+    media: Vec<PathBuf>,
+}
+
+fn read_mount_table() -> MountTable {
+    if let Ok(table) = fs::read_to_string("/proc/self/mountinfo") {
+        let views = crate::space::parse_mountinfo(&table);
+        return MountTable {
+            points: views.iter().map(|mount| guard_key(&mount.point)).collect(),
+            media: media_roots(&views),
+        };
+    }
+    MountTable {
+        points: read_mount_points(),
+        media: Vec::new(),
+    }
+}
+
+/// Only real disks mounted by the desktop under /run/media qualify. A
+/// directory with that spelling, a bind of a system tree, and virtual
+/// filesystems retain the /run guard. Missing information fails closed.
+fn media_roots(mounts: &[crate::space::MountView]) -> Vec<PathBuf> {
+    mounts
+        .iter()
+        .filter(|mount| {
+            mount.point.starts_with("/run/media")
+                && mount.point != Path::new("/run/media")
+                // An overmounted disk can remain in mountinfo. Ambiguous
+                // stacked views must never grant a deletion exception.
+                && mounts.iter().filter(|other| other.point == mount.point).count() == 1
+                && mount.fs_root == Path::new("/")
+                && mount.source.starts_with("/dev/")
+                && matches!(
+                    mount.fstype.as_str(),
+                    "ext2"
+                        | "ext3"
+                        | "ext4"
+                        | "btrfs"
+                        | "xfs"
+                        | "f2fs"
+                        | "vfat"
+                        | "exfat"
+                        | "ntfs"
+                        | "ntfs3"
+                        | "fuseblk"
+                        | "fuse.ntfs-3g"
+                )
+                && !mounts.iter().any(|other| {
+                    !other.point.starts_with("/run/media")
+                        && (other.point == Path::new("/")
+                            || system_tree(&other.point, None).is_some())
+                        && (other.device == mount.device
+                            || other.source == mount.source)
+                })
+        })
+        .map(|mount| mount.point.clone())
+        .collect()
+}
+
+fn on_media(key: &Path, mounts: &[PathBuf], media: &[PathBuf]) -> bool {
+    // Nested mounts do not inherit their parent's exception.
+    mounts
+        .iter()
+        .filter(|point| key.starts_with(point))
+        .max_by_key(|point| point.components().count())
+        .is_some_and(|point| key != point && media.contains(point))
+}
+
 /// The last read of the mount table, and whether a read is under way.
 struct MountCache {
     read: Option<std::time::Instant>,
-    mounts: Option<Arc<Vec<PathBuf>>>,
+    mounts: Option<Arc<MountTable>>,
     refreshing: bool,
 }
 
@@ -545,7 +631,7 @@ static MOUNTS: std::sync::Mutex<MountCache> =
 /// its own thread and is used meanwhile; before the first read lands it is
 /// empty, which is why the app primes it at start with
 /// [`prime_mount_points`].
-fn mount_points() -> Arc<Vec<PathBuf>> {
+fn mount_points() -> Arc<MountTable> {
     let mut cache = MOUNTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -555,7 +641,7 @@ fn mount_points() -> Arc<Vec<PathBuf>> {
         let spawned = thread::Builder::new()
             .name("disktree-mounts".into())
             .spawn(|| {
-                let mounts = Arc::new(read_mount_points());
+                let mounts = Arc::new(read_mount_table());
                 let mut cache = MOUNTS
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -614,6 +700,29 @@ fn windows_mount_points() -> Vec<PathBuf> {
 #[cfg(not(windows))]
 const fn windows_mount_points() -> Vec<PathBuf> {
     Vec::new()
+}
+
+/// The key of the folder every user profile is in, `C:\Users` as
+/// installed; asked of Windows once, since it does not move while running.
+#[cfg(windows)]
+fn profiles_key() -> Option<&'static Path> {
+    static PROFILES: std::sync::LazyLock<Option<PathBuf>> =
+        std::sync::LazyLock::new(|| {
+            crate::windows::user_profiles_dir().map(|dir| guard_key(&dir))
+        });
+    PROFILES.as_deref()
+}
+
+#[cfg(not(windows))]
+const fn profiles_key() -> Option<&'static Path> {
+    None
+}
+
+/// Whether `path`, keyed `key`, is a profile: a directory directly in
+/// `profiles`. A file or a link there is no profile and stays removable.
+fn is_profile(path: &Path, key: &Path, profiles: &Path) -> bool {
+    key.parent() == Some(profiles)
+        && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
 /// A mount point strictly inside the path keyed `key`, if there is one. A
@@ -887,7 +996,7 @@ fn run(
     // The plan was judged against a mount table up to `MOUNTS_FRESH` old,
     // or, right after start, not read yet. Judged again against a fresh
     // read, here on the worker, before anything is touched.
-    let mounts = read_mount_points();
+    let mounts = read_mount_table();
     // Links too: one put on the way down since the plan was made would lead
     // the trash out of the root. Permanent removal on Unix refuses that by
     // itself; see [`open_parent`].
@@ -898,14 +1007,30 @@ fn run(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let reason = mounted(&target.path, &mounts).or_else(|| {
-            linked(
-                &target.path,
-                &plan.root,
-                real_root.as_deref(),
-                home.as_ref(),
-            )
-        });
+        // The /run/media exception must still hold when removal starts;
+        // a disk may have been unmounted since the review was displayed.
+        let reason = target
+            .path
+            .starts_with("/run/media")
+            .then(|| {
+                refuse(
+                    &target.path,
+                    &plan.root,
+                    home.as_ref(),
+                    &mounts.points,
+                    &mounts.media,
+                )
+            })
+            .flatten()
+            .or_else(|| mounted(&target.path, &mounts.points))
+            .or_else(|| {
+                linked(
+                    &target.path,
+                    &plan.root,
+                    real_root.as_deref(),
+                    home.as_ref(),
+                )
+            });
         let outcome = if let Some(reason) = reason {
             Err(io::Error::other(reason))
         } else {
@@ -927,6 +1052,18 @@ fn run(
             bytes: target.bytes,
             outcome: outcome.map_err(|error| error.to_string()),
         });
+    }
+
+    // NTFS writes the file table's records lazily, and the elevated rescan
+    // of a whole drive reads that table from disk, past the cache:
+    // unflushed, the removed entries would still show. Only then; a folder
+    // is walked. Failing only lets the table lag again.
+    #[cfg(windows)]
+    if removed > 0
+        && plan.root.parent().is_none()
+        && crate::access::administrator() == Some(true)
+    {
+        let _ = crate::windows::flush_volume(&plan.root);
     }
 
     let _ = sender.send(RemovalEvent::Done {
@@ -1425,6 +1562,127 @@ mod tests {
         temp
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_media_exception_requires_an_independent_disk() {
+        let views = crate::space::parse_mountinfo(
+            "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+             2 1 0:20 / /run rw - tmpfs tmpfs rw\n\
+             3 2 8:2 / /run/media/user/Games rw - ext4 /dev/sdb rw\n\
+             4 2 8:1 / /run/media/user/System rw - ext4 /dev/root rw\n\
+             5 2 8:2 /folder /run/media/user/Bind rw - ext4 /dev/sdb rw\n\
+             6 2 0:21 / /run/media/user/Virtual rw - tmpfs tmpfs rw\n\
+             7 3 8:1 /etc /run/media/user/Games/nested rw - ext4 /dev/root rw\n",
+        );
+        let media = media_roots(&views);
+        assert_eq!(media, [PathBuf::from("/run/media/user/Games")]);
+        let points: Vec<_> =
+            views.iter().map(|view| view.point.clone()).collect();
+        assert!(on_media(
+            Path::new("/run/media/user/Games/game"),
+            &points,
+            &media
+        ));
+        for path in [
+            "/run/media/user/Games",
+            "/run/media/user/Games/nested/file",
+            "/run/media/user/System/etc",
+            "/run/media/user/Bind/file",
+            "/run/media/user/Virtual/file",
+            "/run/media/user/NotMounted/file",
+            "/run/user/1000/file",
+        ] {
+            assert!(!on_media(Path::new(path), &points, &media), "{path}");
+        }
+        let mut stacked = views.clone();
+        let mut covering = views[3].clone();
+        covering.point = PathBuf::from("/run/media/user/Games");
+        stacked.push(covering);
+        assert!(media_roots(&stacked).is_empty(), "overmounted disk");
+        assert!(media_roots(&[]).is_empty());
+    }
+
+    /// Run in a private mount namespace with the fixture described in
+    /// scripts/test-linux-mounts.sh. Never changes the host's mount table.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the isolated mount fixture"]
+    fn mounted_media_and_repeated_views() {
+        let table =
+            fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        assert!(
+            crate::space::parse_mountinfo(&table)
+                .iter()
+                .any(|mount| mount.point == Path::new("/run")
+                    && mount.source == "disktree-test-run")
+        );
+        let root = Path::new("/run/media/disktree-test");
+        let mounts = read_mount_points();
+        // User namespaces cannot mount a block device. Supply the media
+        // classification separately; the table-policy test above covers it.
+        let media = vec![root.to_path_buf()];
+        let file = root.join("game");
+        fs::write(&file, b"game").expect("fixture");
+        assert_eq!(refuse(&file, root, None, &mounts, &media), None);
+        assert!(refuse(root, Path::new("/"), None, &mounts, &media).is_some());
+        assert!(refuse(&file, root, None, &mounts, &[]).is_some());
+        std::os::unix::fs::symlink("/etc", root.join("link")).expect("link");
+        assert!(
+            refuse(
+                &root.join("link/passwd"),
+                &root.join("link"),
+                None,
+                &mounts,
+                &media
+            )
+            .is_some()
+        );
+        fs::write(root.join("nested/keep"), b"keep").expect("nested");
+        assert!(
+            refuse(&root.join("nested/keep"), root, None, &mounts, &media)
+                .is_some()
+        );
+        remove_permanently(&file, root).expect("delete marked game");
+        assert!(!file.exists());
+        assert!(root.join("nested/keep").exists());
+
+        let scan_root = Path::new("/run/disktree-scan");
+        let options = crate::scan::ScanOptions {
+            apparent_size: true,
+            one_filesystem: false,
+            ..crate::scan::ScanOptions::default()
+        };
+        let tree = crate::scan::scan(scan_root, options.clone()).expect("scan");
+        let root = tree.root();
+        for name in ["one", "two", "original"] {
+            assert!(root.child_named(name).is_some(), "{name}");
+        }
+        assert!(root.child_named("alias").is_none());
+        assert_eq!(root.files(), 3);
+        assert_eq!(root.bytes(), 12);
+        assert!(
+            std::process::Command::new("mount")
+                .args([
+                    "-t",
+                    "tmpfs",
+                    "tmpfs",
+                    "/run/disktree-scan/alias/nested"
+                ])
+                .status()
+                .expect("nested mount")
+                .success()
+        );
+        fs::write(scan_root.join("alias/nested/unique"), b"unique")
+            .expect("unique");
+        let tree = crate::scan::scan(scan_root, options).expect("rescan");
+        let alias = tree.root().child_named("alias").expect("alias retained");
+        assert!(
+            alias
+                .children()
+                .any(|child| child.name() == "nested" && child.files() == 1)
+        );
+    }
+
     #[test]
     fn a_plan_keeps_only_the_outermost_targets() {
         let temp = tree();
@@ -1471,15 +1729,21 @@ mod tests {
     fn the_directories_above_home_are_refused() {
         let home = Home::of(Path::new("/home/disktree-test-user"));
         let reason =
-            refuse(Path::new("/home"), Path::new("/"), Some(&home), &[]);
+            refuse(Path::new("/home"), Path::new("/"), Some(&home), &[], &[]);
         assert!(
             reason.is_some_and(|reason| reason.contains("home directory")),
             "the home directory is inside it"
         );
         assert_eq!(
-            refuse(Path::new("/home/other"), Path::new("/"), Some(&home), &[]),
+            refuse(
+                Path::new("/home/other"),
+                Path::new("/"),
+                Some(&home),
+                &[],
+                &[]
+            ),
             None,
-            "a sibling of home is not"
+            "a sibling of home is not above it"
         );
     }
 
@@ -1535,6 +1799,7 @@ mod tests {
             Path::new("/"),
             Some(&Home::of(home)),
             &[],
+            &[],
         )
         .expect("refused");
         assert!(reason.contains("home directory"), "{reason}");
@@ -1543,6 +1808,7 @@ mod tests {
                 Path::new("/Users/tobi/src"),
                 Path::new("/"),
                 Some(&Home::of(home)),
+                &[],
                 &[]
             )
             .is_none(),
@@ -1561,6 +1827,7 @@ mod tests {
                 Path::new("/"),
                 Some(&Home::of(home)),
                 &[],
+                &[],
             )
             .expect("refused");
             assert!(reason.contains(inside), "{path}: {reason}");
@@ -1570,6 +1837,7 @@ mod tests {
                 Path::new("/opt/local"),
                 Path::new("/"),
                 Some(&Home::of(home)),
+                &[],
                 &[]
             )
             .is_none(),
@@ -1593,9 +1861,12 @@ mod tests {
             "itself"
         );
         let reason =
-            refuse(&root.join("a"), root, None, &mounts).expect("refused");
+            refuse(&root.join("a"), root, None, &mounts, &[]).expect("refused");
         assert!(reason.contains("mounted inside"), "{reason}");
-        assert_eq!(refuse(&root.join("a/one.bin"), root, None, &mounts), None);
+        assert_eq!(
+            refuse(&root.join("a/one.bin"), root, None, &mounts, &[]),
+            None
+        );
     }
 
     #[test]
@@ -1627,13 +1898,17 @@ mod tests {
         // The first read lands on its own thread; wait for it, briefly.
         let mut mounts = mount_points();
         for _ in 0..500 {
-            if !mounts.is_empty() {
+            if !mounts.points.is_empty() {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(10));
             mounts = mount_points();
         }
-        assert_eq!(*mounts, read_mount_points(), "the same table, cached");
+        assert_eq!(
+            mounts.points,
+            read_mount_table().points,
+            "the same table, cached"
+        );
     }
 
     #[test]
@@ -1699,6 +1974,7 @@ mod tests {
                 &data.join("Users/tobi/src"),
                 data,
                 Some(&Home::of(home)),
+                &[],
                 &[]
             )
             .is_none(),
@@ -1708,6 +1984,7 @@ mod tests {
             Path::new("/library/caches"),
             Path::new("/"),
             Some(&Home::of(home)),
+            &[],
             &[],
         )
         .expect("refused");
@@ -2146,6 +2423,7 @@ mod tests {
             &drive,
             Some(&Home::of(&home)),
             &[],
+            &[],
         );
         assert!(
             reason.is_some_and(|reason| reason
@@ -2153,6 +2431,31 @@ mod tests {
                 .contains(&windows.to_lowercase())),
             "refused as part of {windows}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_profiles_are_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let profiles = temp.path();
+        fs::create_dir_all(profiles.join(r"tobi\Downloads")).expect("mkdir");
+        fs::write(profiles.join("notes.txt"), b"x").expect("write");
+        let profile = |relative: &str| {
+            let path = profiles.join(relative);
+            is_profile(&path, &guard_key(&path), &guard_key(profiles))
+        };
+        assert!(profile("tobi"));
+        assert!(profile("TOBI"), "compared as Windows compares names");
+        assert!(!profile("notes.txt"), "a file there is no profile");
+        assert!(!profile(r"tobi\Downloads"), "inside a profile is not one");
+        assert!(!profile("gone"), "nothing there is no profile");
+
+        // The rule itself, against the profiles folder Windows reports.
+        let public = crate::windows::user_profiles_dir()
+            .expect("profiles folder")
+            .join("Public");
+        let reason = refuse(&public, &system_drive(), None, &[], &[]);
+        assert!(reason.is_some_and(|reason| reason.contains("profile")));
     }
 
     #[test]
@@ -2229,6 +2532,7 @@ mod tests {
             Path::new("/etc/hosts"),
             Path::new("/"),
             Some(&Home::of(home)),
+            &[],
             &[],
         );
         assert!(reason.is_some_and(|reason| reason.contains("/etc")));

@@ -222,6 +222,200 @@ pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
     Some(foreign_mounts(&parse_mounts(&table), root))
 }
 
+/// One line of `/proc/self/mountinfo`.
+///
+/// What [`Mount`] says, plus which directory of the filesystem the mount
+/// shows. `/proc/self/mounts` leaves that out, and it is what tells a bind
+/// mount from the filesystem itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountView {
+    /// Kernel filesystem identity; source names such as `tmpfs` repeat.
+    pub device: String,
+    pub source: String,
+    pub fstype: String,
+    pub point: PathBuf,
+    /// The directory inside the filesystem that appears at `point`: `/` for
+    /// a whole filesystem, `/@home` for a Btrfs subvolume, the bound
+    /// directory for a bind mount.
+    pub fs_root: PathBuf,
+}
+
+/// Parse `/proc/self/mountinfo`. Lines it cannot read are skipped.
+pub fn parse_mountinfo(table: &str) -> Vec<MountView> {
+    table
+        .lines()
+        .filter_map(|line| {
+            // Optional fields run up to a lone `-`; after it come the type
+            // and the source.
+            let (left, right) = line.split_once(" - ")?;
+            let mut left = left.split_whitespace().skip(2);
+            let device = left.next()?.to_string();
+            let fs_root = PathBuf::from(unescape_octal(left.next()?));
+            let point = PathBuf::from(unescape_octal(left.next()?));
+            let mut right = right.split_whitespace();
+            let fstype = right.next()?.to_string();
+            let source = unescape_octal(right.next()?);
+            Some(MountView {
+                device,
+                source,
+                fstype,
+                point,
+                fs_root,
+            })
+        })
+        .collect()
+}
+
+/// The kernel writes space, tab, newline and backslash in mount fields as
+/// three octal digits after a backslash. Decoded in one pass, so a name that
+/// really contains `\040` is not decoded twice.
+fn unescape_octal(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let digits = bytes.get(index + 1..index + 4);
+        let value = digits
+            .filter(|_| bytes[index] == b'\\')
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        if let Some(value) = value {
+            out.push(value);
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Paths under `root` that show a directory the scan already reaches
+/// another way, so walking them would count the same files twice.
+///
+/// A bind mount, a second mount of the same disk, or the top of a Btrfs
+/// filesystem mounted beside its subvolumes all show one directory at two
+/// paths. Device numbers cannot tell: a bind mount has its original's. The
+/// mount table can, since each line names the filesystem and the directory
+/// of it that is shown. When one directory is visible twice, the view
+/// showing the widest part of the filesystem is kept, and the narrower one
+/// is left out. The scanned root itself is never left out; if it is the
+/// narrower view, its copy inside the wider one is.
+pub fn repeated_mounts(mounts: &[MountView], root: &Path) -> Vec<PathBuf> {
+    repeated_mounts_excluding(mounts, root, &[])
+}
+
+fn same_filesystem(left: &MountView, right: &MountView) -> bool {
+    left.fstype == right.fstype
+        && (left.device == right.device
+            // Btrfs assigns device numbers per subvolume. Its block device
+            // identifies the filesystem shared by those different roots.
+            || (left.fstype == "btrfs"
+                && left.source.starts_with("/dev/")
+                && left.source == right.source))
+}
+
+fn covering_mount<'a>(
+    mounts: &'a [MountView],
+    path: &Path,
+) -> Option<&'a MountView> {
+    mounts
+        .iter()
+        .filter(|mount| path.starts_with(&mount.point))
+        .max_by_key(|mount| mount.point.components().count())
+}
+
+fn repeated_mounts_excluding(
+    mounts: &[MountView],
+    root: &Path,
+    excluded: &[PathBuf],
+) -> Vec<PathBuf> {
+    let own = covering_mount(mounts, root);
+    let mut visible: Vec<&MountView> = mounts
+        .iter()
+        .filter(|mount| {
+            (mount.point.starts_with(root) || Some(*mount) == own)
+                && !excluded.iter().any(|skip| mount.point.starts_with(skip))
+        })
+        .collect();
+    visible.sort_by_key(|mount| {
+        (
+            mount.fs_root.components().count(),
+            mount.point.components().count(),
+            &mount.point,
+        )
+    });
+    let mut kept: Vec<&MountView> = Vec::new();
+    let mut repeated: Vec<PathBuf> = Vec::new();
+    for mount in visible {
+        let elsewhere = kept.iter().find_map(|wider| {
+            if !same_filesystem(wider, mount) {
+                return None;
+            }
+            let inside = mount.fs_root.strip_prefix(&wider.fs_root).ok()?;
+            let path = wider.point.join(inside);
+            if !path.starts_with(root)
+                || path == mount.point
+                || excluded
+                    .iter()
+                    .chain(&repeated)
+                    .any(|skip| path.starts_with(skip))
+            {
+                return None;
+            }
+            // Another mount can hide the supposed original directory.
+            let covering = covering_mount(mounts, &path)?;
+            let relative = path.strip_prefix(&covering.point).ok()?;
+            (same_filesystem(covering, mount)
+                && covering.fs_root.join(relative) == mount.fs_root)
+                .then_some(path)
+        });
+        let skip = elsewhere.map(|copy| {
+            if mount.point != root && mount.point.starts_with(root) {
+                mount.point.clone()
+            } else {
+                copy
+            }
+        });
+        if let Some(skip) = skip
+            && !root.starts_with(&skip)
+            // A duplicate view can contain independently mounted data.
+            // Keep it rather than hiding that data with its parent.
+            && !mounts.iter().any(|child| child.point != skip && child.point.starts_with(&skip))
+        {
+            if skip != mount.point {
+                kept.push(mount);
+            }
+            repeated.push(skip);
+        } else {
+            kept.push(mount);
+        }
+    }
+    repeated
+}
+
+/// [`repeated_mounts`] for this machine, in `root`'s own spelling. Empty
+/// where there is no `/proc/self/mountinfo`.
+pub fn repeated_mounts_for(
+    root: &Path,
+    canonical: &Path,
+    one_filesystem: bool,
+) -> Vec<PathBuf> {
+    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    let excluded = if one_filesystem {
+        foreign_mounts_for(canonical).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    repeated_mounts_excluding(&parse_mountinfo(&table), canonical, &excluded)
+        .iter()
+        .filter_map(|path| path.strip_prefix(canonical).ok())
+        .map(|below| root.join(below))
+        .collect()
+}
+
 /// The mount points in what macOS's `mount` prints.
 ///
 /// One per line: `/dev/disk3s5 on /System/Volumes/Data (apfs, local, …)`.
@@ -329,6 +523,171 @@ pub const fn foreign_mounts_for(_root: &Path) -> Option<Vec<PathBuf>> {
     Some(Vec::new())
 }
 
+/// A mounted volume the picker can switch the scan to: where it is mounted
+/// and how much room it has. Listed by [`volumes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    /// Where the volume is mounted: `C:\` on Windows, `/` or `/home` on
+    /// Linux, `/` on macOS.
+    pub point: PathBuf,
+    /// What is mounted there, when the table names it: a device such as
+    /// `/dev/nvme0n1p2`, or a name like `tmpfs`.
+    pub device: Option<String>,
+    /// Free space on the volume now; `None` when it cannot be read.
+    pub space: Option<SpaceInfo>,
+}
+
+/// Every volume worth offering as a scan root, fullest first.
+///
+/// Pseudo filesystems (`/proc`, `/sys`, tmpfs, …), snapshot subvolumes and
+/// automount points are left out: switching the scan to one of those would
+/// measure the wrong thing, the same reason [`foreign_mounts`] keeps a scan
+/// from entering them. Duplicates from one device mounted twice (a btrfs
+/// subvolume at `/` and `/home`) collapse to the shortest mount point, which
+/// is the top of that disk.
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn volumes() -> Vec<Volume> {
+    let Ok(table) = std::fs::read_to_string("/proc/self/mounts") else {
+        return Vec::new();
+    };
+    volumes_in(&parse_mounts(&table))
+}
+
+/// [`volumes`] over a given mount table, for testing.
+pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
+    let mut seen: Vec<&Mount> = Vec::new();
+    for mount in mounts {
+        if !is_volume_candidate(mount) {
+            continue;
+        }
+        // One device mounted twice (a btrfs disk at `/`, `/home`,
+        // `/var/log`) is one volume: keep the shortest mount point, which is
+        // the top of that disk.
+        if let Some(known) = seen.iter_mut().find(|known| {
+            known.source == mount.source && known.fstype == mount.fstype
+        }) {
+            if mount.point.as_os_str().len() < known.point.as_os_str().len() {
+                *known = mount;
+            }
+            continue;
+        }
+        seen.push(mount);
+    }
+    let mut volumes: Vec<Volume> = seen
+        .iter()
+        .map(|mount| Volume {
+            point: mount.point.clone(),
+            device: Some(mount.source.clone()),
+            space: space_info(&mount.point).ok(),
+        })
+        .collect();
+    // The scarcest room is the most interesting to a cleanup tool, so the
+    // fullest volume that still reads is first; unreadable ones sort last.
+    sort_by_free_space(&mut volumes);
+    volumes
+}
+
+/// Fullest first; an unreadable volume sorts last.
+fn sort_by_free_space(volumes: &mut [Volume]) {
+    volumes.sort_by_key(|volume| {
+        (
+            volume.space.is_none(),
+            volume.space.map_or(0, |space| space.available),
+            volume.point.clone(),
+        )
+    });
+}
+
+/// Whether the mount is a real disk worth scanning: a device-backed
+/// filesystem that is not a snapshot, an automount point, or one of the
+/// pseudo filesystems the scan itself refuses to enter.
+fn is_volume_candidate(mount: &Mount) -> bool {
+    if is_snapshot(mount) {
+        return false;
+    }
+    if mount
+        .options
+        .split(',')
+        .any(|option| option == "automounted" || option.starts_with("autofs"))
+    {
+        return false;
+    }
+    !matches!(
+        mount.fstype.as_str(),
+        "autofs"
+            | "cgroup"
+            | "cgroup2"
+            | "configfs"
+            | "debugfs"
+            | "devpts"
+            | "devtmpfs"
+            | "fuse.portal"
+            | "fusectl"
+            | "hugetlbfs"
+            | "mqueue"
+            | "nsfs"
+            | "overlay"
+            | "proc"
+            | "pstore"
+            | "securityfs"
+            | "sysfs"
+            | "tmpfs"
+            | "tracefs"
+    )
+}
+
+/// Every volume worth offering as a scan root, fullest first.
+///
+/// The Data volume's second mount is the same disk under another name, so it
+/// is left out; the firmlinks joined into `/` mean `/` already shows it.
+#[cfg(target_os = "macos")]
+pub fn volumes() -> Vec<Volume> {
+    use std::process::Command;
+
+    let output = Command::new("mount")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok());
+    let Some(output) = output else {
+        return Vec::new();
+    };
+    let mut points = parse_macos_mounts(&output);
+    points.retain(|point| {
+        point.as_os_str() != MACOS_DATA_VOLUME && !point.as_os_str().is_empty()
+    });
+    let mut volumes: Vec<Volume> = points
+        .iter()
+        .map(|point| Volume {
+            point: point.clone(),
+            device: device_for(point),
+            space: space_info(point).ok(),
+        })
+        .collect();
+    sort_by_free_space(&mut volumes);
+    volumes
+}
+
+/// Every place a volume is mounted that can be scanned.
+///
+/// Drive roots such as `D:\` and folders a volume is mounted on. Unready
+/// drives (an empty card reader reports a path but no space) are left out,
+/// since there is nothing to measure there.
+#[cfg(windows)]
+pub fn volumes() -> Vec<Volume> {
+    let mut volumes: Vec<Volume> = crate::windows::mount_points()
+        .into_iter()
+        .filter_map(|point| {
+            space_info(&point).ok().map(|space| Volume {
+                point,
+                device: None,
+                space: Some(space),
+            })
+        })
+        .collect();
+    sort_by_free_space(&mut volumes);
+    volumes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +704,156 @@ systemd-1 /mnt/nas-home autofs rw,direct 0 0
 tmpfs /tmp tmpfs rw 0 0
 portal /run/user/1000/doc fuse.portal rw 0 0
 ";
+
+    const MOUNTINFO: &str = "\
+22 1 0:21 /@ / rw,relatime - btrfs /dev/mapper/root rw,subvol=/@
+23 22 0:21 /@home /home rw,relatime - btrfs /dev/mapper/root rw,subvol=/@home
+24 22 0:21 /@log /var/log rw,relatime - btrfs /dev/mapper/root rw,subvol=/@log
+25 22 0:21 /@snapshots /.snapshots rw - btrfs /dev/mapper/root rw
+26 22 0:30 / /data rw,relatime shared:5 - btrfs /dev/mapper/data rw
+27 22 0:30 / /mnt/data rw,relatime shared:5 - btrfs /dev/mapper/data rw
+28 22 0:31 / /tmp rw - tmpfs tmpfs rw
+29 22 259:3 / /boot rw - vfat /dev/nvme0n1p1 rw
+";
+
+    fn repeated(table: &str, root: &str) -> Vec<PathBuf> {
+        let mut paths =
+            repeated_mounts(&parse_mountinfo(table), Path::new(root));
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn subvolumes_are_not_repeats_but_a_second_mount_of_a_disk_is() {
+        assert_eq!(repeated(MOUNTINFO, "/"), [PathBuf::from("/mnt/data")]);
+        assert!(repeated(MOUNTINFO, "/home/tobi").is_empty());
+        assert!(repeated(MOUNTINFO, "/data").is_empty());
+        assert!(
+            repeated(MOUNTINFO, "/mnt/data").is_empty(),
+            "the view that was asked for is scanned"
+        );
+    }
+
+    #[test]
+    fn a_bind_mount_inside_the_scan_is_left_out() {
+        let table = format!(
+            "{MOUNTINFO}30 23 0:21 /@home/tobi/src /srv/src rw - btrfs /dev/mapper/root rw\n"
+        );
+        assert_eq!(
+            repeated(&table, "/"),
+            [PathBuf::from("/mnt/data"), PathBuf::from("/srv/src")]
+        );
+        // From home, the original is outside the scan: nothing repeats.
+        assert!(repeated(&table, "/home/tobi").is_empty());
+        assert!(repeated(&table, "/srv").is_empty());
+    }
+
+    #[test]
+    fn the_top_of_a_btrfs_disk_beside_its_subvolumes_is_counted_once() {
+        let table = format!(
+            "{MOUNTINFO}31 22 0:21 / /mnt/top rw - btrfs /dev/mapper/root rw\n"
+        );
+        // The root cannot be left out, so its copy under /mnt/top is; the
+        // other subvolumes are seen under /mnt/top instead of twice.
+        assert_eq!(
+            repeated(&table, "/"),
+            [
+                PathBuf::from("/.snapshots"),
+                PathBuf::from("/home"),
+                PathBuf::from("/mnt/data"),
+                PathBuf::from("/mnt/top/@"),
+                PathBuf::from("/var/log"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unrelated_tmpfs_mounts_are_not_duplicates() {
+        let table = "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                     2 1 0:20 / /one rw - tmpfs tmpfs rw\n\
+                     3 1 0:21 / /two rw - tmpfs tmpfs rw\n";
+        assert!(repeated(table, "/").is_empty());
+        let alias =
+            format!("{table}4 1 0:20 / /three rw - tmpfs different-name rw\n");
+        assert_eq!(repeated(&alias, "/"), [PathBuf::from("/three")]);
+    }
+
+    #[test]
+    fn hidden_original_and_nested_mounts_are_preserved() {
+        let hidden = "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                      2 1 0:20 / /data rw - tmpfs tmpfs rw\n\
+                      3 2 8:1 /data/source /data/bind rw - ext4 /dev/root rw\n";
+        assert!(repeated(hidden, "/").is_empty());
+        let nested = "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                      2 1 8:1 /original /view rw - ext4 /dev/root rw\n\
+                      3 2 0:20 / /view/unique rw - tmpfs tmpfs rw\n";
+        assert!(repeated(nested, "/").is_empty());
+    }
+
+    #[test]
+    fn excluded_views_cannot_replace_visible_files() {
+        let mounts = parse_mountinfo(
+            "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                                     2 1 8:1 /original /view rw - ext4 /dev/root rw\n",
+        );
+        assert!(
+            repeated_mounts_excluding(
+                &mounts,
+                Path::new("/"),
+                &[PathBuf::from("/original")]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn btrfs_subvolume_devices_can_differ() {
+        let table = "1 0 0:20 /@ / rw - btrfs /dev/root rw\n\
+                     2 1 0:21 /@home /home rw - btrfs /dev/root rw\n\
+                     3 1 0:22 / /top rw - btrfs /dev/root rw\n";
+        assert_eq!(
+            repeated(table, "/"),
+            [PathBuf::from("/home"), PathBuf::from("/top/@")]
+        );
+    }
+
+    #[test]
+    fn mountinfo_escapes_are_decoded_once() {
+        let mounts = parse_mountinfo(
+            "not a mount line\n\
+             40 22 8:1 /a\\040b /media/My\\040Disk\\134040 rw - ext4 /dev/sda1 rw\n",
+        );
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].fs_root, Path::new("/a b"));
+        assert_eq!(mounts[0].point, Path::new("/media/My Disk\\040"));
+        assert_eq!(mounts[0].source, "/dev/sda1");
+        assert_eq!(mounts[0].fstype, "ext4");
+    }
+
+    #[test]
+    fn volumes_with_least_space_come_first_and_unknowns_last() {
+        let volume = |name: &str, available: Option<u64>| Volume {
+            point: PathBuf::from(name),
+            device: None,
+            space: available.map(|available| SpaceInfo {
+                total: 100,
+                free: available,
+                available,
+            }),
+        };
+        let mut volumes = vec![
+            volume("unknown", None),
+            volume("roomy", Some(90)),
+            volume("full", Some(0)),
+            volume("nearly-full", Some(5)),
+        ];
+        sort_by_free_space(&mut volumes);
+        let names: Vec<_> = volumes.iter().map(|v| v.point.clone()).collect();
+        assert_eq!(
+            names,
+            ["full", "nearly-full", "roomy", "unknown"].map(PathBuf::from)
+        );
+    }
 
     #[test]
     fn a_volume_includes_its_subvolumes_and_nothing_else() {
@@ -364,6 +873,33 @@ portal /run/user/1000/doc fuse.portal rw 0 0
         .map(PathBuf::from)
         .collect();
         assert_eq!(foreign, expected, "/home and /var/log are the same disk");
+    }
+
+    #[test]
+    fn volume_candidates_are_real_disks_not_pseudo_filesystems() {
+        let mounts = parse_mounts(OMARCHY);
+        let points: Vec<PathBuf> = volumes_in(&mounts)
+            .iter()
+            .map(|volume| volume.point.clone())
+            .collect();
+        // One btrfs disk (at `/`, collapsing `/home` and `/var/log`), plus
+        // the boot disk; tmpfs, autofs, portals and snapshots are not scans.
+        assert!(points.contains(&PathBuf::from("/")), "{points:?}");
+        assert!(points.contains(&PathBuf::from("/boot")), "{points:?}");
+        assert_eq!(points.len(), 2, "{points:?}");
+    }
+
+    #[test]
+    fn separate_home_disk_is_its_own_volume() {
+        let separate = parse_mounts(
+            "/dev/sda1 / ext4 rw 0 0\n/dev/sdb1 /home ext4 rw 0 0\n",
+        );
+        let points: Vec<PathBuf> = volumes_in(&separate)
+            .iter()
+            .map(|volume| volume.point.clone())
+            .collect();
+        assert!(points.contains(&PathBuf::from("/")), "{points:?}");
+        assert!(points.contains(&PathBuf::from("/home")), "{points:?}");
     }
 
     #[test]

@@ -40,9 +40,21 @@ make install
 `sudo make install PREFIX=/usr/local` installs system-wide; `make uninstall`
 removes exactly what was installed.
 
+On Arch, including Omarchy, disktree is in the AUR:
+[`disktree`](https://aur.archlinux.org/packages/disktree) builds each release
+from source, and
+[`disktree-bin`](https://aur.archlinux.org/packages/disktree-bin) installs
+the release binary:
+
+```sh
+yay -S disktree-bin
+```
+
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
 can drive (Vulkan). Distributions often package an older Rust;
-[rustup](https://rustup.rs) installs a current one.
+[rustup](https://rustup.rs) installs a current one. The repo pins 1.97 in
+`rust-toolchain.toml`, so with rustup the right toolchain is fetched on the
+first build even if `rustup default` points at something older.
 
 ### macOS
 
@@ -211,6 +223,8 @@ and shows how much free space was actually gained.
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
+| `esc` while scanning | stop the scan |
+| `v` | scan another mounted volume |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
@@ -241,9 +255,18 @@ escaped in the prompt, so it cannot pass for another path.
   a home directory. Symlinks are not followed.
 
 The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
-scope per root, a completion counter per directory so no directory is built
-before its last subdirectory lands, and one bottom-up pass that aggregates sizes
-and removes duplicate hardlinks.
+scope per root, and a completion counter per directory so no directory is built
+before its last subdirectory lands. Each directory then totals and orders its
+entries into a flat tree: a few dozen bytes an entry and its name, no heap
+block per file. A hardlinked file is charged under the first name listed.
+
+## Switching volumes
+
+Press `v` (or click **Volumes** beside the disk name in the side panel) to
+bring up the volume picker. It lists every candidate volume mounted on the
+system together with its free space, ordered fullest first, filtering out
+pseudo-filesystems and duplicate btrfs/APFS mount points. Selecting any
+entry resets the scan root directly to that volume.
 
 ## The whole disk
 
@@ -285,14 +308,74 @@ The same program, with Windows' answers to the questions above:
   folder another volume is mounted on is a link, like a junction, and is
   not entered, so a scan stays on one volume; `-l` follows links, and with
   them mounted folders.
+- **Run as administrator** and the whole disk is read from NTFS's master
+  file table instead of walked, as WizTree does: one pass over the table in
+  large reads. On a 4-million-file `C:\` that took about 3.4 s against 11.2
+  s for WizTree and about 20 s for the walk. It also sees what the walk is
+  refused, such as System Volume Information. It is used only for a whole
+  NTFS drive, since a folder would still cost the whole table, and not with
+  `-l`, whose links the table does not follow. disktree flushes the volume
+  after its own removals so the rescan shows them; changes other programs
+  made seconds before may not show yet.
+  During that read, record facts use 256-record pages: stretches skipped
+  as free have no record storage. File record numbers stay unchanged, so
+  journal updates still find their records directly.
+  Each stored record uses 32 bytes, with full-width sizes and timestamps;
+  only the attribute facts that affect traversal are retained.
+  The finished tree that read made is kept under
+  `%LOCALAPPDATA%\disktree\admin` (about 280 MB for that drive),
+  and the next launch or rescan starts from it: NTFS's change journal
+  names every file changed since, and only those are
+  read again, from NTFS itself rather than the disk, and only the folders
+  holding them, and those above, are totalled, ordered and classified
+  again. On the same drive a launch took about 0.4 s and a quarter of the
+  CPU of a whole read's 3.8 s. The whole table is read again when the
+  journal no longer reaches back that far (it holds a few hours of a busy
+  disk), when more than 100,000 files changed, when the scan options
+  differ from the kept tree's, when a folder whose contents the tree never
+  held comes into view (a cloud folder made local), or a day after the
+  last whole read.
+  An NTFS folder walk keeps a separate `walk-*.bin` tree snapshot:
+  directly under `%LOCALAPPDATA%\disktree` without admin rights,
+  or in its `admin` subdirectory when elevated, written on a thread of
+  its own once the tree is shown. The next launch reads
+  the unprivileged change journal, lists changed directories and all
+  cached hardlink aliases, and updates only the changed ancestor totals.
+  New or moved-in directories are walked. Corrupt caches, changed root or
+  journal IDs, journal gaps, more than 100,000 affected files or 10,000
+  directories, and snapshots older than a day cause a full walk. Network
+  shares, non-NTFS volumes, followed links and depth limits use the walk.
+  Known open writers and the 1,024 largest cached files also get a current
+  metadata query on every launch. This covers large long-running writers
+  such as a WSL disk image even when their old journal entries have expired.
+  This is a bounded rule, not a filesystem snapshot: an older writer below
+  that set can stay stale until close or the next full walk. Set
+  `ScanOptions::cache` to `None` when that limitation is unacceptable.
+  Hardlink names can report different stale directory-listing allocations,
+  so a fresh parallel walk can also assign a different byte count to the
+  same file depending on which name it charges first.
+  An elevated scan keeps its caches only in that `admin` subdirectory,
+  which it makes owned by Administrators, with a protected ACL that
+  grants access to Administrators and SYSTEM alone, and it writes and
+  renames them through the directory's handle, so a link planted above
+  it cannot send them elsewhere. It refuses a directory or file there
+  that fails that check or is a link, and scans afresh; it never reads
+  the caches a scan without admin rights keeps beside it.
+  On a whole NTFS drive without `-l`, or once Windows refuses the walk a
+  folder, the side panel offers **Restart as Administrator**, which reopens
+  the same folder and options through the UAC prompt; during a widening
+  scan, the wider folder being scanned.
 - **Move to trash** is the Recycle Bin, through the shell, which asks
   before destroying anything it cannot recycle.
 - **Refused besides the rules below:** Windows, Program Files and
   ProgramData, what Windows keeps at the top of its drive (System Volume
   Information, Recovery, Boot, and the page and hibernation files, which
-  Settings turns off), and any folder holding your profile, such as
-  `C:\Users`. Names compare without regard to case, as Windows compares
-  them.
+  Settings turns off), any folder holding your profile, such as
+  `C:\Users`, and every profile in the folder Windows keeps them in
+  (`C:\Users\*`, `Public` and `Default` included), since an elevated
+  disktree may run as another account and can reach them all. What is
+  inside a profile can still be removed, as under your own. Names compare
+  without regard to case, as Windows compares them.
 - **Hidden** means a name starting with a dot, or the hidden attribute, so
   `-H` drops `AppData` as Explorer hides it.
 - **The theme** follows Windows' light or dark setting, since there is no
