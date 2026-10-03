@@ -16,12 +16,16 @@ mod appearance;
 mod git;
 mod marks;
 mod palette;
+#[cfg(windows)]
+mod shell_menu;
 mod state;
+mod terminal;
 #[cfg(test)]
 mod tests;
 mod treemap_view;
 mod ui;
 mod views;
+mod watch;
 mod widgets;
 
 use std::path::PathBuf;

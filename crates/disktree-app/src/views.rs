@@ -13,7 +13,7 @@ use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
     FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
+    MouseButton, MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
     pattern_slash, px, relative,
 };
@@ -27,7 +27,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
 use crate::state::{
-    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
+    ColorMode, ContextMenu, Crumb, Disktree, MenuAction, PANEL_REMS, Screen,
+    panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -94,6 +95,8 @@ pub fn root(
                 return;
             }
             this.on_key_down(event, cx);
+            #[cfg(windows)]
+            this.open_shell_menu(window, cx);
             this.apply_focus(window, cx);
         }))
         .relative()
@@ -105,8 +108,22 @@ pub fn root(
         .font_family(theme.font)
         .text_size(text::BODY)
         .child(body);
-    if let Some(tip) = cursor_tooltip(app, window, cx) {
+    if app.context_menu.is_none()
+        && let Some(tip) = cursor_tooltip(app, window, cx)
+    {
         root = root.child(tip);
+    }
+    if let Some(menu) = app.context_menu.clone() {
+        let theme = cx.omarchy().clone();
+        root = root.child(
+            deferred(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(context_menu(app, &menu, &theme, cx)),
+            )
+            .with_priority(3),
+        );
     }
     if app.show_help {
         root = root.child(help_overlay(app, cx));
@@ -119,6 +136,110 @@ pub fn root(
     }
     root
 }
+
+/// What can be done with one tile, at the pointer, the way a file manager's
+/// right-click menu offers it.
+fn context_menu(
+    app: &Disktree,
+    menu: &ContextMenu,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> impl IntoElement {
+    let name = app.path_at(&menu.target).map_or_else(String::new, |path| {
+        crate::marks::display_path(&path, app.home.as_deref())
+    });
+    let marked = app
+        .path_at(&menu.target)
+        .is_some_and(|path| app.marks.contains(&path));
+    let mut panel = div()
+        .id("context-menu")
+        .debug_selector(|| "context-menu".into())
+        .occlude()
+        .flex()
+        .flex_col()
+        .w(size::CONTEXT_MENU)
+        .p(space::XS)
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.control_border())
+        .shadow_lg()
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.context_menu = None;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .px(space::SM)
+                .py(space::XS)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.8))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(name),
+        );
+    for (index, item) in app.context_items(&menu.target).into_iter().enumerate()
+    {
+        let (label, keys) = match item {
+            MenuAction::Open => ("Open", "enter"),
+            MenuAction::Reveal => (REVEAL_LABEL, "o"),
+            MenuAction::CopyPath => ("Copy path", ""),
+            MenuAction::Mark if marked => ("Unmark", "space"),
+            MenuAction::Mark => ("Mark", "space"),
+            MenuAction::Terminal => ("Open terminal here", ""),
+            #[cfg(windows)]
+            MenuAction::MoreOptions => ("Show more options", ""),
+        };
+        #[cfg(windows)]
+        if item == MenuAction::MoreOptions {
+            panel = panel.child(separator(cx));
+        }
+        let highlighted = menu.highlighted == index;
+        panel = panel.child(
+            div()
+                .id(ElementId::Name(format!("context-item-{index}").into()))
+                .debug_selector(move || format!("context-item-{index}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::MD)
+                .px(space::SM)
+                .py(space::XS)
+                .when(highlighted, |this| this.bg(theme.hover_fill()))
+                .hover(|style| style.bg(theme.hover_fill()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_context_item(item, cx);
+                    #[cfg(windows)]
+                    this.open_shell_menu(window, cx);
+                    window.focus(&this.focus, cx);
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(text::BODY)
+                        .text_color(theme.bright)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(keys),
+                ),
+        );
+    }
+    panel
+}
+
+/// What the file manager is called here.
+const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else if cfg!(windows) {
+    "Show in File Explorer"
+} else {
+    "Show in the file manager"
+};
 
 /// Picking another volume scans it from scratch: the picker lists every
 /// volume with its free space, and the choice is the new root.
@@ -1453,6 +1574,19 @@ fn worth_section(
                     this.reveal(crumbs.clone(), cx);
                     window.focus(&this.focus, cx);
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener({
+                        let crumbs = candidate.crumbs.clone();
+                        move |this, event: &MouseDownEvent, _, cx| {
+                            this.open_context_menu(
+                                crumbs.clone(),
+                                event.position,
+                                cx,
+                            );
+                        }
+                    }),
+                )
                 .child(div().flex_shrink_0().w(px(2.)).h(space::XL).bg(accent))
                 .child(
                     div()
@@ -1584,6 +1718,22 @@ fn marked_section(
                 .items_center()
                 .gap(space::SM)
                 .text_size(text::CAPTION)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener({
+                        let path = item.path.clone();
+                        move |this, event: &MouseDownEvent, _, cx| {
+                            // A mark outside the tree has no tile to act on.
+                            if let Some(crumbs) = this.crumbs_for_path(&path) {
+                                this.open_context_menu(
+                                    crumbs,
+                                    event.position,
+                                    cx,
+                                );
+                            }
+                        }
+                    }),
+                )
                 .child(
                     div()
                         .flex_shrink_0()
@@ -1980,7 +2130,7 @@ fn review_button(
 /// to every other key and the scan's own numbers hold the trailing edge.
 fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     // Most useful first, so a narrow window clips the least useful.
-    let hints: [(&str, &str); 11] = [
+    let hints: [(&str, &str); 12] = [
         ("space", "mark"),
         ("enter", "open"),
         ("\u{232b}", "up"),
@@ -1992,6 +2142,7 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         ("0", "reset"),
         ("v", "volumes"),
         ("r", "rescan"),
+        ("shift-f10", "menu"),
     ];
     let mut lane = div()
         .flex()
@@ -2043,6 +2194,13 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
             "scan {} entries{elapsed}",
             widgets::human_count(app.progress.files)
         )
+    };
+    let scan = match &app.watch {
+        Some(watch) => format!(
+            "{scan} \u{00b7} watching {}",
+            crate::marks::display_path(&watch.folder, app.home.as_deref())
+        ),
+        None => scan,
     };
     row.child(widgets::hint("?", "all keys", cx).flex_shrink_0())
         .child(
@@ -3304,6 +3462,11 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                 "Show it in the file manager"
             },
         ),
+        (
+            "right-click",
+            "What can be done with a tile or a listed path",
+        ),
+        ("shift-f10 / menu", "The same menu, for the selection"),
         ("q", "Quit"),
         ("", ""),
         (

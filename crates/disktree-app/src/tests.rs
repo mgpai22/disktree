@@ -1633,3 +1633,239 @@ fn restart_arguments_parse_back_to_the_same_scan() {
         );
     }
 }
+
+/// The menu rows' debug selectors, which must outlive the test.
+const CONTEXT_ROWS: [&str; 6] = [
+    "context-item-0",
+    "context-item-1",
+    "context-item-2",
+    "context-item-3",
+    "context-item-4",
+    "context-item-5",
+];
+
+/// Where junk's name band is on screen: junk itself, not its children.
+fn junk_band(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+) -> (Vec<usize>, Point<Pixels>) {
+    update(view, cx, |app, _| {
+        let junk = child_crumbs(app, &[], "junk");
+        let band = app
+            .layout()
+            .and_then(|tiles| {
+                tiles.iter().find(|tile| tile.crumbs() == junk.as_slice())
+            })
+            .and_then(|tile| tile.header)
+            .expect("junk is drawn with a band");
+        let screen = app.view.project(band);
+        let origin = app.treemap_origin.get();
+        let at = Point::new(
+            origin.x + px(screen.x + screen.w / 2.0),
+            origin.y + px(screen.y + screen.h / 2.0),
+        );
+        (junk, at)
+    })
+}
+
+fn right_click(cx: &mut Window, at: Point<Pixels>) {
+    use gpui_kit::{Modifiers, MouseButton};
+    cx.simulate_mouse_move(at, None, Modifiers::none());
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+    draw(cx);
+}
+
+/// The row of the open menu that runs `action`.
+fn menu_row(
+    view: &Entity<Disktree>,
+    cx: &Window,
+    action: crate::state::MenuAction,
+) -> usize {
+    read(view, cx, |app| {
+        let menu = app.context_menu.as_ref().expect("the menu is open");
+        app.context_items(&menu.target)
+            .iter()
+            .position(|&item| item == action)
+            .expect("the menu lists it")
+    })
+}
+
+#[gpui_kit::test]
+fn a_right_click_selects_the_tile_and_copies_its_path(cx: &mut TestAppContext) {
+    use crate::state::MenuAction;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+
+    let (junk, at) = junk_band(&view, cx);
+    right_click(cx, at);
+    let (target, selected) = read(&view, cx, |app| {
+        (
+            app.context_menu.as_ref().map(|menu| menu.target.clone()),
+            app.selected.clone(),
+        )
+    });
+    assert_eq!(target.as_ref(), Some(&junk));
+    assert_eq!(selected, Some(junk));
+    assert!(
+        cx.debug_bounds("context-menu").is_some(),
+        "the menu is drawn"
+    );
+
+    let row = menu_row(&view, cx, MenuAction::CopyPath);
+    let bounds = cx
+        .debug_bounds(CONTEXT_ROWS[row])
+        .expect("the row is drawn");
+    cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("a path on the clipboard");
+    assert_eq!(PathBuf::from(copied), temp.path().join("junk"));
+    assert!(read(&view, cx, |app| app.context_menu.is_none()));
+}
+
+#[gpui_kit::test]
+fn the_menu_marks_from_the_keyboard_and_closes_like_a_menu(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::MenuAction;
+    use gpui_kit::{Modifiers, MouseButton};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let (junk, at) = junk_band(&view, cx);
+
+    // Escape closes it, and nothing behind it acts.
+    right_click(cx, at);
+    press(cx, "escape");
+    let (open, selected) = read(&view, cx, |app| {
+        (app.context_menu.is_some(), app.selected.clone())
+    });
+    assert!(!open);
+    assert_eq!(selected, Some(junk.clone()), "escape went to the menu");
+
+    // A click outside closes it.
+    right_click(cx, at);
+    let corner = gpui_kit::point(px(4.), px(4.));
+    cx.simulate_mouse_down(corner, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(corner, MouseButton::Left, Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.context_menu.is_none()));
+
+    // Shift-F10 opens it for the selection; the arrows and Enter mark.
+    press(cx, "shift-f10");
+    let target = read(&view, cx, |app| {
+        app.context_menu.as_ref().map(|menu| menu.target.clone())
+    });
+    assert_eq!(target, Some(junk));
+    for _ in 0..menu_row(&view, cx, MenuAction::Mark) {
+        press(cx, "down");
+    }
+    press(cx, "enter");
+    let marked = read(&view, cx, |app| app.marks.items().to_vec());
+    assert_eq!(marked.len(), 1);
+    assert_eq!(marked[0].path, temp.path().join("junk"));
+    assert!(read(&view, cx, |app| app.context_menu.is_none()));
+}
+
+#[gpui_kit::test]
+fn a_right_click_on_the_merged_tail_is_for_the_folder_on_screen(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::treemap::TileKind;
+
+    cx.update(gpui_omarchy::init);
+    // More files than the layout draws one by one, of equal size, so the
+    // rest merge into a tile large enough to point at.
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let many = temp.path().join("many");
+    std::fs::create_dir(&many).expect("mkdir");
+    for index in 0..300 {
+        std::fs::write(many.join(format!("file-{index}.bin")), [b'x'; 4096])
+            .expect("write");
+    }
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let inside = update(&view, cx, |app, cx| {
+        let many = child_crumbs(app, &[], "many");
+        app.go_to(many.clone(), cx);
+        many
+    });
+    draw(cx);
+    let (at, selected) = update(&view, cx, |app, _| {
+        let tail = app
+            .layout()
+            .and_then(|tiles| {
+                tiles
+                    .iter()
+                    .find(|tile| matches!(tile.kind, TileKind::Others { .. }))
+                    .map(|tile| tile.rect)
+            })
+            .expect("the small files merge");
+        let screen = app.view.project(tail);
+        let origin = app.treemap_origin.get();
+        (
+            Point::new(
+                origin.x + px(screen.x + screen.w / 2.0),
+                origin.y + px(screen.y + screen.h / 2.0),
+            ),
+            app.selected.clone(),
+        )
+    });
+    right_click(cx, at);
+    let (target, after) = read(&view, cx, |app| {
+        (
+            app.context_menu.as_ref().map(|menu| menu.target.clone()),
+            app.selected.clone(),
+        )
+    });
+    assert_eq!(target, Some(inside));
+    assert_eq!(after, selected, "the merged tail is not a selection");
+}
+
+#[gpui_kit::test]
+fn refreshing_a_folder_shows_what_changed_on_disk(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let junk_bytes = |view: &Entity<Disktree>, cx: &Window| {
+        read(view, cx, |app| {
+            let junk = child_crumbs(app, &[], "junk");
+            app.node_at(&junk).map(Node::bytes).expect("junk")
+        })
+    };
+    let before = junk_bytes(&view, cx);
+    // Keep junk selected across the swap, by path.
+    update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        app.select(Some(junk), cx);
+    });
+    std::fs::write(temp.path().join("junk/new.bin"), vec![b'x'; 50_000])
+        .expect("write");
+    update(&view, cx, |app, cx| {
+        app.refresh_folder(temp.path().join("junk"), cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(junk_bytes(&view, cx), before + 50_000);
+    // junk outgrew .cache, so its crumbs moved: the selection follows it.
+    let names = read(&view, cx, |app| {
+        app.selected
+            .as_deref()
+            .and_then(|selected| app.node_at(selected))
+            .map(|node| node.name().to_string())
+            .expect("the selection is still there")
+    });
+    assert_eq!(names, "junk");
+}
