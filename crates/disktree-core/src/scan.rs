@@ -37,6 +37,10 @@ use crate::tree::{
 #[path = "walk_cache.rs"]
 mod walk_cache;
 
+#[path = "refresh.rs"]
+mod refresh;
+pub use refresh::refresh_folder;
+
 /// Errors kept verbatim before the list is truncated; the count keeps rising.
 const MAX_ERROR_DETAIL: usize = 50;
 
@@ -328,6 +332,17 @@ struct WalkContext {
     /// cannot leave it: every listing takes it instead of asking. See
     /// [`crate::windows::walk_volume`].
     volume: OnceLock<u64>,
+    /// Walk the folder and nothing else: no file table read, no kept tree
+    /// resumed or saved. A refresh of one folder sets it, since both read
+    /// or write a whole volume's or root's tree. See [`refresh_folder`].
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "only Windows reads a file table or keeps a walk"
+        )
+    )]
+    plain: bool,
 }
 
 impl WalkContext {
@@ -347,6 +362,7 @@ impl WalkContext {
             visited_dirs: Mutex::new(FxHashSet::default()),
             build: Builder::new(WALK_POOL.current_num_threads()),
             volume: OnceLock::new(),
+            plain: false,
         }
     }
 }
@@ -955,9 +971,13 @@ fn scan_blocking(
     #[cfg(windows)]
     {
         let progress = &context.progress;
-        let read = WALK_POOL.install(|| {
-            crate::mft::scan(root, canonical, &context.options, progress)
-        });
+        let read = if context.plain {
+            None
+        } else {
+            WALK_POOL.install(|| {
+                crate::mft::scan(root, canonical, &context.options, progress)
+            })
+        };
         if let Some(tree) = read {
             let tree = tree?;
             // Cancelled after the reader's last check: the rescan that
@@ -992,7 +1012,11 @@ fn scan_blocking(
     }
 
     #[cfg(windows)]
-    let cache = walk_cache::Checkpoint::open(canonical, context);
+    let cache = if context.plain {
+        None
+    } else {
+        walk_cache::Checkpoint::open(canonical, context)
+    };
     #[cfg(windows)]
     if let Some(cache) = &cache
         && let Some(mut tree) = WALK_POOL.install(|| cache.resume(context))
