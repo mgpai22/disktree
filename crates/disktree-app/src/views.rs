@@ -4,6 +4,8 @@
 //! always exactly what the state says — there is no second copy of anything to
 //! keep in sync.
 
+use std::sync::Arc;
+
 use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::removal::{RemovalMode, Target};
@@ -13,9 +15,9 @@ use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
     FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
-    pattern_slash, px, relative,
+    MouseButton, MouseDownEvent, ParentElement, Rems, RenderImage,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window,
+    anchored, deferred, div, img, pattern_slash, point, px, relative,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, ChoiceItem, Theme, alert_dialog, button,
@@ -26,10 +28,9 @@ use gpui_omarchy::{
 use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
-#[cfg(not(windows))]
-use crate::state::ContextMenu;
 use crate::state::{
-    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
+    ColorMode, ContextMenu, Crumb, Disktree, MenuRow, PANEL_REMS, Screen,
+    panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -96,8 +97,6 @@ pub fn root(
                 return;
             }
             this.on_key_down(event, cx);
-            #[cfg(windows)]
-            this.open_shell_menu(window, cx);
             this.apply_focus(window, cx);
         }))
         .relative()
@@ -109,33 +108,37 @@ pub fn root(
         .font_family(theme.font)
         .text_size(text::BODY)
         .child(body);
-    // The press picked the target, deeper down; the menu opens on release,
-    // as Windows menus do, so the release cannot pick a row. Only this
-    // listener has the window the native menu needs.
-    #[cfg(windows)]
-    {
-        root = root.on_mouse_up(
-            MouseButton::Right,
-            cx.listener(|this, _, window, cx| this.open_shell_menu(window, cx)),
-        );
-    }
     if app.context_menu.is_none()
         && let Some(tip) = cursor_tooltip(app, window, cx)
     {
         root = root.child(tip);
     }
-    // Windows shows it natively instead, Explorer's rows included.
-    #[cfg(not(windows))]
     if let Some(menu) = app.context_menu.clone() {
         let theme = cx.omarchy().clone();
+        // Any press outside the menu and its flyouts closes it, and still
+        // reaches what is under it: the backdrop does not occlude, and the
+        // menu's panels, which do, keep their own presses.
+        root = root.child(
+            deferred(
+                div()
+                    .id("context-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .on_any_mouse_down(cx.listener(|this, _, _, cx| {
+                        this.context_menu = None;
+                        cx.notify();
+                    })),
+            )
+            .with_priority(3),
+        );
         root = root.child(
             deferred(
                 anchored()
                     .position(menu.position)
                     .snap_to_window_with_margin(px(8.))
-                    .child(context_menu(app, &menu, &theme, cx)),
+                    .child(context_panel(app, &menu, 0, &theme, window, cx)),
             )
-            .with_priority(3),
+            .with_priority(4),
         );
     }
     if app.show_help {
@@ -150,38 +153,70 @@ pub fn root(
     root
 }
 
+/// How one row of the right-click menu is drawn.
+struct RowLook {
+    label: SharedString,
+    /// The key that does the same outside the menu.
+    key: &'static str,
+    icon: Option<Arc<RenderImage>>,
+    checked: bool,
+    /// Explorer's default, as in its own menu.
+    bold: bool,
+    enabled: bool,
+    /// It opens a flyout.
+    submenu: bool,
+}
+
 /// What can be done with one tile, at the pointer, the way a file manager's
-/// right-click menu offers it.
-#[cfg(not(windows))]
-fn context_menu(
+/// right-click menu offers it: level `depth` of it, the menu itself or a
+/// flyout, with the flyout open from one of its rows drawn beside that row.
+fn context_panel(
     app: &Disktree,
     menu: &ContextMenu,
+    depth: usize,
     theme: &Theme,
+    window: &Window,
     cx: &Context<'_, Disktree>,
-) -> impl IntoElement {
-    let name = app.path_at(&menu.target).map_or_else(String::new, |path| {
-        crate::marks::display_path(&path, app.home.as_deref())
-    });
+) -> Stateful<Div> {
+    let rows = app.context_level(menu, depth);
     let marked = app
         .path_at(&menu.target)
         .is_some_and(|path| app.marks.contains(&path));
+    // A level with any icon keeps a column for them on every row, so the
+    // labels line up.
+    #[cfg(windows)]
+    let icons = rows.iter().any(|row| {
+        matches!(row, MenuRow::Shell(row) if row.icon.is_some() || row.checked)
+    });
+    #[cfg(not(windows))]
+    let icons = false;
+    let rem = window.rem_size();
+    let selector = if depth == 0 {
+        "context-menu".to_string()
+    } else {
+        format!("context-flyout-{depth}")
+    };
     let mut panel = div()
-        .id("context-menu")
-        .debug_selector(|| "context-menu".into())
+        .id(ElementId::Name(selector.clone().into()))
+        .debug_selector(move || selector)
         .occlude()
         .flex()
         .flex_col()
         .w(size::CONTEXT_MENU)
+        // Within the window's margins, scrolling what does not fit:
+        // Explorer's part can be long.
+        .max_h(window.viewport_size().height - px(16.))
+        .overflow_y_scroll()
         .p(space::XS)
         .bg(theme.surface)
         .border_1()
         .border_color(theme.control_border())
-        .shadow_lg()
-        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-            this.context_menu = None;
-            cx.notify();
-        }))
-        .child(
+        .shadow_lg();
+    if depth == 0 {
+        let name = app.path_at(&menu.target).map_or_else(String::new, |path| {
+            crate::marks::display_path(&path, app.home.as_deref())
+        });
+        panel = panel.child(
             div()
                 .px(space::SM)
                 .py(space::XS)
@@ -192,40 +227,127 @@ fn context_menu(
                 .text_ellipsis()
                 .child(name),
         );
-    for (index, item) in app.context_items(&menu.target).into_iter().enumerate()
-    {
-        let highlighted = menu.highlighted == index;
-        panel = panel.child(
-            div()
-                .id(ElementId::Name(format!("context-item-{index}").into()))
-                .debug_selector(move || format!("context-item-{index}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(space::MD)
-                .px(space::SM)
-                .py(space::XS)
-                .when(highlighted, |this| this.bg(theme.hover_fill()))
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let look = match row {
+            MenuRow::Own(item) => RowLook {
+                label: item.label(marked).into(),
+                key: item.key(),
+                icon: None,
+                checked: false,
+                bold: false,
+                enabled: true,
+                submenu: false,
+            },
+            #[cfg(windows)]
+            MenuRow::Separator => {
+                panel = panel.child(separator(cx));
+                continue;
+            }
+            #[cfg(windows)]
+            MenuRow::Shell(row) => RowLook {
+                label: row.label.clone().into(),
+                key: "",
+                icon: row.icon.clone(),
+                checked: row.checked,
+                bold: row.default,
+                enabled: row.enabled,
+                submenu: row.children.is_some(),
+            },
+        };
+        let highlighted = menu.highlighted.get(depth) == Some(&index);
+        let id = if depth == 0 {
+            format!("context-item-{index}")
+        } else {
+            format!("context-{depth}-{index}")
+        };
+        let mut item = div()
+            .id(ElementId::Name(id.clone().into()))
+            .debug_selector(move || id)
+            .relative()
+            // Rows keep their height; a long menu scrolls instead.
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::MD)
+            .px(space::SM)
+            .py(space::XS)
+            .when(highlighted, |this| this.bg(theme.hover_fill()));
+        if look.enabled {
+            item = item
                 .hover(|style| style.bg(theme.hover_fill()))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.choose_context_item(item, cx);
-                    window.focus(&this.focus, cx);
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.hover_context_row(depth, index, cx);
+                    }
                 }))
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(text::BODY)
-                        .text_color(theme.bright)
-                        .child(item.label(marked)),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(text::CAPTION)
-                        .text_color(theme.secondary)
-                        .child(item.key()),
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.activate_context_row(depth, index, cx);
+                    window.focus(&this.focus, cx);
+                }));
+        }
+        if icons {
+            let slot = div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(icon::MENU)
+                .text_size(text::CAPTION)
+                .text_color(theme.bright);
+            item = item.child(match look.icon {
+                Some(image) => slot.child(img(image).size(icon::MENU)),
+                None if look.checked => slot.child("✓"),
+                None => slot,
+            });
+        }
+        item = item
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(text::BODY)
+                    .text_color(if look.enabled {
+                        theme.bright
+                    } else {
+                        theme.secondary.opacity(0.6)
+                    })
+                    .when(look.bold, |this| this.font_weight(FontWeight::BOLD))
+                    .child(look.label),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(if look.submenu { "›" } else { look.key }),
+            );
+        if highlighted && menu.highlighted.len() > depth + 1 {
+            // From the row's corner: beside the panel's right edge, its
+            // first row level with this one; on the left of the row
+            // instead when the window has no room on the right.
+            let inset = space::XS.to_pixels(rem) + px(1.);
+            let beside =
+                point(size::CONTEXT_MENU.to_pixels(rem) - inset, -inset);
+            item = item.child(
+                div().absolute().top_0().left_0().child(
+                    deferred(anchored().offset(beside).child(context_panel(
+                        app,
+                        menu,
+                        depth + 1,
+                        theme,
+                        window,
+                        cx,
+                    )))
+                    .with_priority(5 + depth),
                 ),
-        );
+            );
+        }
+        panel = panel.child(item);
     }
     panel
 }

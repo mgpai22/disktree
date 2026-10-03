@@ -62,6 +62,9 @@ pub mod icon {
     pub const SM: Rems = Rems(0.75);
     pub const MD: Rems = Rems(0.875);
     pub const LG: Rems = Rems(1.375);
+    /// A right-click menu row's icon column: Explorer's row bitmaps are a
+    /// 16 px small icon at the default rem.
+    pub const MENU: Rems = Rems(1.0);
 }
 
 /// Region and lane widths. Each is the comfortable default for its content at
@@ -72,9 +75,8 @@ pub mod size {
     /// A crumb's sibling menu.
     pub const SIBLING_MENU: Rems = Rems(24.0);
     pub const SIBLING_MENU_HEIGHT: Rems = Rems(32.0);
-    /// The right-click menu: its longest row, with a key beside it. Windows
-    /// shows a native one instead.
-    #[cfg(not(windows))]
+    /// The right-click menu and its flyouts: a row with a key beside it,
+    /// Explorer's longer names cut short.
     pub const CONTEXT_MENU: Rems = Rems(15.0);
     /// A list row's share bar.
     pub const ROW_BAR: Rems = Rems(5.5);

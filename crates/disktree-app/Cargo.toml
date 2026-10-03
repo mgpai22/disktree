@@ -26,6 +26,8 @@ notify = "8"
 [target.'cfg(windows)'.dependencies]
 # The window's HWND, for the Explorer menu; gpui-pre implements it.
 raw-window-handle = "0.6"
+# The frame type GPUI draws Explorer's row icons from; gpui-pre has it.
+image = { version = "0.25", default-features = false }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

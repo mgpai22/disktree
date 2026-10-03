@@ -1635,7 +1635,6 @@ fn restart_arguments_parse_back_to_the_same_scan() {
 }
 
 /// The menu rows' debug selectors, which must outlive the test.
-#[cfg(not(windows))]
 const CONTEXT_ROWS: [&str; 5] = [
     "context-item-0",
     "context-item-1",
@@ -1677,7 +1676,6 @@ fn right_click(cx: &mut Window, at: Point<Pixels>) {
 }
 
 /// The row of the open menu that runs `action`.
-#[cfg(not(windows))]
 fn menu_row(
     view: &Entity<Disktree>,
     cx: &Window,
@@ -1692,24 +1690,17 @@ fn menu_row(
     })
 }
 
-/// Run `action` from the open menu: by clicking its drawn row, or on
-/// Windows, where the menu is native and the harness only records what it
-/// was asked to show, as a pick in that menu does.
+/// Run `action` from the open menu by clicking its drawn row.
 fn choose(
     view: &Entity<Disktree>,
     cx: &mut Window,
     action: crate::state::MenuAction,
 ) {
-    #[cfg(not(windows))]
-    {
-        let row = menu_row(view, cx, action);
-        let bounds = cx
-            .debug_bounds(CONTEXT_ROWS[row])
-            .expect("the row is drawn");
-        cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
-    }
-    #[cfg(windows)]
-    update(view, cx, |app, cx| app.choose_context_item(action, cx));
+    let row = menu_row(view, cx, action);
+    let bounds = cx
+        .debug_bounds(CONTEXT_ROWS[row])
+        .expect("the row is drawn");
+    cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
     draw(cx);
 }
 
@@ -1733,10 +1724,9 @@ fn a_right_click_selects_the_tile_and_copies_its_path(cx: &mut TestAppContext) {
     });
     assert_eq!(target.as_ref(), Some(&junk));
     assert_eq!(selected, Some(junk));
-    assert_eq!(
+    assert!(
         cx.debug_bounds("context-menu").is_some(),
-        cfg!(not(windows)),
-        "the menu is drawn by disktree except on Windows"
+        "the menu is drawn"
     );
 
     choose(&view, cx, MenuAction::CopyPath);
@@ -1784,10 +1774,7 @@ fn shift_f10_asks_for_the_selection_and_mark_toggles(cx: &mut TestAppContext) {
     draw(cx);
     let (junk, at) = junk_band(&view, cx);
     right_click(cx, at);
-    #[cfg(not(windows))]
     press(cx, "escape");
-    #[cfg(windows)]
-    update(&view, cx, |app, _| app.context_menu = None);
 
     for marked in [1, 0] {
         press(cx, "shift-f10");
@@ -1802,7 +1789,6 @@ fn shift_f10_asks_for_the_selection_and_mark_toggles(cx: &mut TestAppContext) {
     }
 }
 
-#[cfg(not(windows))]
 #[gpui_kit::test]
 fn the_menu_marks_from_the_keyboard_and_closes_like_a_menu(
     cx: &mut TestAppContext,
@@ -1848,6 +1834,112 @@ fn the_menu_marks_from_the_keyboard_and_closes_like_a_menu(
     assert_eq!(marked.len(), 1);
     assert_eq!(marked[0].path, temp.path().join("junk"));
     assert!(read(&view, cx, |app| app.context_menu.is_none()));
+}
+
+/// Explorer's rows as the menu draws them, made up so the test does not
+/// read this machine's shell extensions: a disabled row, separators, and a
+/// submenu whose flyout the keys and the pointer open and close.
+#[cfg(windows)]
+#[gpui_kit::test]
+fn explorer_rows_open_flyouts_and_skip_what_cannot_be_picked(
+    cx: &mut TestAppContext,
+) {
+    use crate::shell_menu::{ShellItem, ShellRow};
+    use gpui_kit::Modifiers;
+
+    let row = |id, label: &str, enabled, children: Option<Vec<ShellItem>>| {
+        ShellItem::Row(ShellRow {
+            id,
+            label: label.to_string(),
+            enabled,
+            checked: false,
+            default: false,
+            icon: None,
+            children: children.map(Into::into),
+        })
+    };
+    let highlighted = |view: &Entity<Disktree>, cx: &Window| {
+        read(view, cx, |app| {
+            app.context_menu
+                .as_ref()
+                .map(|menu| menu.highlighted.clone())
+        })
+    };
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let (_, at) = junk_band(&view, cx);
+    right_click(cx, at);
+    let own = update(&view, cx, |app, _| {
+        let menu = app.context_menu.as_ref().expect("the menu is open");
+        let own = app.context_items(&menu.target).len();
+        if let Some(menu) = &mut app.context_menu {
+            menu.shell_items = vec![
+                row(1, "Greyed", false, None),
+                ShellItem::Separator,
+                row(
+                    0,
+                    "Send to",
+                    true,
+                    Some(vec![
+                        row(2, "Off", false, None),
+                        row(3, "Zip", true, None),
+                    ]),
+                ),
+            ]
+            .into();
+        }
+        own
+    });
+    draw(cx);
+    // Five own rows for a folder: the separator after them is row 5, the
+    // greyed row 6, the next separator 7, "Send to" 8.
+    assert_eq!(own, 5);
+    let send_to = 8;
+
+    press(cx, "end");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to]));
+    press(cx, "up");
+    assert_eq!(highlighted(&view, cx), Some(vec![own - 1]), "skips 5-7");
+    press(cx, "down");
+    press(cx, "right");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]), "not Off");
+    let menu = cx.debug_bounds("context-menu").expect("the menu is drawn");
+    let flyout = cx.debug_bounds("context-flyout-1").expect("and its flyout");
+    assert!(
+        flyout.left() >= menu.right() - px(8.)
+            || flyout.right() <= menu.left() + px(8.),
+        "beside the menu, not over it: {menu:?} {flyout:?}"
+    );
+    press(cx, "up");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]));
+    press(cx, "left");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to]));
+    assert!(cx.debug_bounds("context-flyout-1").is_none());
+    press(cx, "enter");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]));
+    press(cx, "escape");
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to]));
+
+    // A greyed row takes no click, and the pointer opens the flyout.
+    let greyed = cx.debug_bounds("context-item-6").expect("drawn");
+    cx.simulate_click(greyed.center(), Modifiers::none());
+    draw(cx);
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to]));
+    let item = cx.debug_bounds("context-item-8").expect("drawn");
+    cx.simulate_mouse_move(item.center(), None, Modifiers::none());
+    draw(cx);
+    assert_eq!(highlighted(&view, cx), Some(vec![send_to, 1]));
+    let zip = cx.debug_bounds("context-1-1").expect("the flyout's row");
+    cx.simulate_click(zip.center(), Modifiers::none());
+    draw(cx);
+    assert!(
+        read(&view, cx, |app| app.context_menu.is_none()),
+        "a pick closes the menu"
+    );
 }
 
 #[gpui_kit::test]

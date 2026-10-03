@@ -1427,6 +1427,7 @@ dependencies = [
  "dunce",
  "gpui-kit",
  "gpui-omarchy",
+ "image",
  "notify 8.2.0",
  "raw-window-handle",
  "rustc-hash 2.1.3",

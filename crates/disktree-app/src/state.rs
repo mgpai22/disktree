@@ -34,6 +34,8 @@ use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::git::GitState;
+#[cfg(windows)]
+use crate::shell_menu::{ShellItem, ShellRow};
 
 use crate::marks::{Marks, display_path, is_hidden};
 use crate::treemap_view::{Mosaic, TileDeco};
@@ -59,18 +61,91 @@ pub struct CrumbMenu {
     pub highlighted: usize,
 }
 
-/// The right-click menu, open. On Windows it is shown natively, and this
-/// only lives from the click to the listener that has the window.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The right-click menu, open: disktree's rows, then on Windows
+/// Explorer's, all drawn here.
+#[derive(Clone, Debug)]
 pub struct ContextMenu {
     /// What it acts on, by crumbs from the scanned root.
     pub target: Vec<usize>,
     /// Its top-left corner, in window pixels: where the pointer was.
     pub position: Point<Pixels>,
-    /// The row the arrow keys are on, an index into
-    /// [`Disktree::context_items`].
-    #[cfg(not(windows))]
-    pub highlighted: usize,
+    /// The row the arrow keys are on in the menu, then in each open
+    /// flyout: the submenu of the row highlighted a level up. Never empty;
+    /// rows index [`Disktree::context_level`].
+    pub highlighted: Vec<usize>,
+    /// Explorer's menu for the target, kept alive while its rows show;
+    /// `None` until it has loaded, and for good if it failed.
+    #[cfg(windows)]
+    pub shell: Option<Rc<crate::shell_menu::ShellMenu>>,
+    /// Explorer's rows, below disktree's.
+    #[cfg(windows)]
+    pub shell_items: Rc<[ShellItem]>,
+    /// Whether loading Explorer's menu has started: it starts once the
+    /// menu has been drawn with disktree's rows, so it never waits on the
+    /// shell.
+    #[cfg(windows)]
+    pub shell_asked: bool,
+}
+
+/// One row of an open level of the right-click menu.
+#[derive(Clone, Debug)]
+pub enum MenuRow {
+    Own(MenuAction),
+    #[cfg(windows)]
+    Separator,
+    #[cfg(windows)]
+    Shell(ShellRow),
+}
+
+impl MenuRow {
+    /// Whether the keys and the pointer may highlight it.
+    pub const fn selectable(&self) -> bool {
+        match self {
+            Self::Own(_) => true,
+            #[cfg(windows)]
+            Self::Separator => false,
+            #[cfg(windows)]
+            Self::Shell(row) => row.enabled,
+        }
+    }
+
+    /// The rows of the flyout it opens: none for a row without one.
+    pub fn children(&self) -> Vec<Self> {
+        match self {
+            #[cfg(windows)]
+            Self::Shell(row) => {
+                row.children.as_deref().map_or_else(Vec::new, shell_rows)
+            }
+            #[cfg(windows)]
+            Self::Own(_) | Self::Separator => Vec::new(),
+            #[cfg(not(windows))]
+            Self::Own(_) => Vec::new(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn shell_rows(items: &[ShellItem]) -> Vec<MenuRow> {
+    items
+        .iter()
+        .map(|item| match item {
+            ShellItem::Separator => MenuRow::Separator,
+            ShellItem::Row(row) => MenuRow::Shell(row.clone()),
+        })
+        .collect()
+}
+
+/// The row the arrows move to from `at`: the next one down (`forward`) or
+/// up that can be highlighted, or `at` itself at the end.
+pub fn step(selectable: &[bool], at: usize, forward: bool) -> usize {
+    let found = if forward {
+        (at + 1..selectable.len()).find(|&row| selectable[row])
+    } else {
+        (0..at.min(selectable.len()))
+            .rev()
+            .find(|&row| selectable[row])
+    };
+    found.unwrap_or(at)
 }
 
 /// One row of the right-click menu.
@@ -2505,8 +2580,13 @@ impl Disktree {
         self.context_menu = Some(ContextMenu {
             target,
             position,
-            #[cfg(not(windows))]
-            highlighted: 0,
+            highlighted: vec![0],
+            #[cfg(windows)]
+            shell: None,
+            #[cfg(windows)]
+            shell_items: Rc::new([]),
+            #[cfg(windows)]
+            shell_asked: false,
         });
         cx.notify();
     }
@@ -2559,10 +2639,32 @@ impl Disktree {
         items
     }
 
+    /// The rows of the open level `depth` of `menu`: disktree's rows and
+    /// Explorer's at the top, then each flyout's.
+    pub fn context_level(
+        &self,
+        menu: &ContextMenu,
+        depth: usize,
+    ) -> Vec<MenuRow> {
+        let mut rows: Vec<MenuRow> = self
+            .context_items(&menu.target)
+            .into_iter()
+            .map(MenuRow::Own)
+            .collect();
+        #[cfg(windows)]
+        if !menu.shell_items.is_empty() {
+            rows.push(MenuRow::Separator);
+            rows.extend(shell_rows(&menu.shell_items));
+        }
+        for &at in menu.highlighted.iter().take(depth) {
+            rows = rows.get(at).map_or_else(Vec::new, MenuRow::children);
+        }
+        rows
+    }
+
     /// Keys while the right-click menu is open, as in a sibling menu: it
     /// owns the arrows, Enter and Escape, and any other key closes it
-    /// before acting.
-    #[cfg(not(windows))]
+    /// before acting. Right opens a flyout, Left and Escape close it.
     fn on_context_key(
         &mut self,
         key: &str,
@@ -2571,24 +2673,34 @@ impl Disktree {
         let Some(menu) = self.context_menu.clone() else {
             return false;
         };
-        let items = self.context_items(&menu.target);
-        let last = items.len().saturating_sub(1);
-        let highlight = |this: &mut Self, row: usize| {
+        let depth = menu.highlighted.len() - 1;
+        let at = menu.highlighted[depth];
+        let selectable: Vec<bool> = self
+            .context_level(&menu, depth)
+            .iter()
+            .map(MenuRow::selectable)
+            .collect();
+        let first = selectable.iter().position(|&row| row);
+        let last = selectable.iter().rposition(|&row| row);
+        let close_flyout = |this: &mut Self| {
             if let Some(menu) = &mut this.context_menu {
-                menu.highlighted = row;
+                menu.highlighted.pop();
             }
         };
         match key {
-            "down" | "j" => highlight(self, (menu.highlighted + 1).min(last)),
-            "up" | "k" => highlight(self, menu.highlighted.saturating_sub(1)),
-            "home" => highlight(self, 0),
-            "end" => highlight(self, last),
-            "enter" | "space" => {
-                if let Some(&item) = items.get(menu.highlighted) {
-                    self.choose_context_item(item, cx);
-                }
+            "down" | "j" => {
+                self.highlight_context_row(depth, step(&selectable, at, true));
             }
+            "up" | "k" => {
+                self.highlight_context_row(depth, step(&selectable, at, false));
+            }
+            "home" => self.highlight_context_row(depth, first.unwrap_or(at)),
+            "end" => self.highlight_context_row(depth, last.unwrap_or(at)),
+            "right" => self.open_context_flyout(depth, at),
+            "left" | "escape" if depth > 0 => close_flyout(self),
             "escape" => self.context_menu = None,
+            "enter" | "space" => self.activate_context_row(depth, at, cx),
+            "left" => {}
             _ => {
                 self.context_menu = None;
                 cx.notify();
@@ -2597,6 +2709,87 @@ impl Disktree {
         }
         cx.notify();
         true
+    }
+
+    /// Highlight row `index` of level `depth`, closing any flyout deeper
+    /// than it; a row that cannot be highlighted is left alone.
+    fn highlight_context_row(&mut self, depth: usize, index: usize) {
+        let Some(menu) = &self.context_menu else {
+            return;
+        };
+        let selectable = depth < menu.highlighted.len()
+            && self
+                .context_level(menu, depth)
+                .get(index)
+                .is_some_and(MenuRow::selectable);
+        if let Some(menu) = &mut self.context_menu
+            && selectable
+        {
+            menu.highlighted.truncate(depth + 1);
+            menu.highlighted[depth] = index;
+        }
+    }
+
+    /// Highlight row `index` of level `depth` and open its flyout, if it
+    /// has one, on its first row that can be highlighted.
+    fn open_context_flyout(&mut self, depth: usize, index: usize) {
+        self.highlight_context_row(depth, index);
+        let Some(menu) = &self.context_menu else {
+            return;
+        };
+        if menu.highlighted.get(depth) != Some(&index) {
+            return;
+        }
+        let first = self
+            .context_level(menu, depth)
+            .get(index)
+            .map(MenuRow::children)
+            .and_then(|rows| rows.iter().position(MenuRow::selectable));
+        if let Some(menu) = &mut self.context_menu {
+            menu.highlighted.extend(first);
+        }
+    }
+
+    /// The pointer is on row `index` of level `depth`: highlight it, and
+    /// open its flyout as a native menu does.
+    pub fn hover_context_row(
+        &mut self,
+        depth: usize,
+        index: usize,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.open_context_flyout(depth, index);
+        cx.notify();
+    }
+
+    /// Enter, Space or a click on row `index` of level `depth`: run it, or
+    /// open the flyout it stands for. A disabled row does nothing.
+    pub fn activate_context_row(
+        &mut self,
+        depth: usize,
+        index: usize,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(menu) = &self.context_menu else {
+            return;
+        };
+        let Some(row) = self.context_level(menu, depth).into_iter().nth(index)
+        else {
+            return;
+        };
+        match row {
+            MenuRow::Own(item) => self.choose_context_item(item, cx),
+            #[cfg(windows)]
+            MenuRow::Separator
+            | MenuRow::Shell(ShellRow { enabled: false, .. }) => {}
+            #[cfg(windows)]
+            MenuRow::Shell(ShellRow {
+                children: Some(_), ..
+            }) => self.open_context_flyout(depth, index),
+            #[cfg(windows)]
+            MenuRow::Shell(row) => self.choose_shell_row(row.id, cx),
+        }
+        cx.notify();
     }
 
     /// Run a row of the open menu, and close it.
@@ -2668,69 +2861,117 @@ impl Disktree {
         cx.notify();
     }
 
-    /// Show the native menu for what [`Self::open_context_menu`] asked
-    /// for: disktree's rows, then Explorer's. It runs in a task, outside
-    /// this entity's update: the menu's modal loop lets GPUI draw and run
-    /// tasks, which would find the app already borrowed.
+    /// Load Explorer's rows into the open menu, once it has been drawn
+    /// with disktree's own, so it never waits on the shell. Rendering
+    /// calls it, having the window the shell's dialogs belong to. The load
+    /// runs in a task, outside this entity's update: a handler may pump
+    /// messages, and GPUI would find the app already borrowed.
     #[cfg(windows)]
-    pub fn open_shell_menu(&mut self, window: &Window, cx: &Context<'_, Self>) {
-        // The harness has no native window for a modal menu to block on;
-        // the request stays in `context_menu`, for a test to choose from.
-        if cfg!(test) {
-            return;
-        }
-        let Some(menu) = self.context_menu.take() else {
+    fn load_shell_menu(&mut self, window: &Window, cx: &Context<'_, Self>) {
+        let Some(menu) = &mut self.context_menu else {
             return;
         };
+        if menu.shell_asked {
+            return;
+        }
+        menu.shell_asked = true;
+        let target = menu.target.clone();
+        // The harness has no native window: its menus keep disktree's
+        // rows alone, whatever this machine's Explorer adds.
         let (Some(path), Some(hwnd)) =
-            (self.path_at(&menu.target), crate::shell_menu::hwnd(window))
+            (self.path_at(&target), crate::shell_menu::hwnd(window))
         else {
             return;
         };
-        let items = self.context_items(&menu.target);
-        let marked = self.marks.contains(&path);
-        // A tab lets Win32 right-align the key, as in any native menu.
-        let labels: Vec<String> = items
-            .iter()
-            .map(|item| match item.key() {
-                "" => item.label(marked).to_string(),
-                key => {
-                    let (first, rest) = key.split_at(1);
-                    format!(
-                        "{}\t{}{rest}",
-                        item.label(marked),
-                        first.to_ascii_uppercase()
-                    )
-                }
-            })
-            .collect();
-        let default = items.iter().position(|&item| item == MenuAction::Open);
-        let scale = window.scale_factor();
-        let x = (menu.position.x.as_f32() * scale).round() as i32;
-        let y = (menu.position.y.as_f32() * scale).round() as i32;
         cx.spawn(async move |this, cx| {
-            use crate::shell_menu::{Chosen, changes_disk, show};
-            let chosen = show(hwnd, &path, &labels, default, x, y);
-            let _ = this.update(cx, |this, cx| match chosen {
-                Ok(Chosen::Own(row)) => {
-                    // The tree may have been refreshed while the menu was
-                    // open, moving the crumbs: find the target again.
-                    if let (Some(&item), Some(target)) =
-                        (items.get(row), this.crumbs_for_path(&path))
-                    {
-                        this.context_menu =
-                            Some(ContextMenu { target, ..menu });
-                        this.choose_context_item(item, cx);
-                    }
+            // Without Explorer's part, for a path gone since or a broken
+            // handler, disktree's rows still work, so they show alone.
+            let Ok(shell) = crate::shell_menu::load(hwnd, &path) else {
+                return;
+            };
+            let shell = Rc::new(shell);
+            let weak = Rc::downgrade(&shell);
+            // The open menu holds Explorer's after the first read; this
+            // task only looks again while it does.
+            let mut held = Some(shell);
+            // Handlers such as "Send to" and Defender add rows over the
+            // next moments, from messages this thread's loop delivers
+            // between the reads. ponytail: a fixed schedule; rows later
+            // than its last read stay missing until the menu reopens.
+            for wait in [0, 100, 250, 500, 1000, 2000] {
+                cx.background_executor()
+                    .timer(Duration::from_millis(wait))
+                    .await;
+                let Some(shell) = held.take().or_else(|| weak.upgrade()) else {
+                    return;
+                };
+                let rows = shell.rows();
+                let shown = this.update(cx, |this, cx| {
+                    this.show_shell_rows(shell, &path, rows, cx)
+                });
+                if !shown.unwrap_or(false) {
+                    return;
                 }
-                Ok(Chosen::Shell(verb)) if changes_disk(&verb) => {
+            }
+        })
+        .detach();
+    }
+
+    /// Put Explorer's `rows` into the open menu, if it is the one `shell`
+    /// was loaded for; whether it is. A change closes any flyout, whose
+    /// rows may have moved.
+    #[cfg(windows)]
+    fn show_shell_rows(
+        &mut self,
+        shell: Rc<crate::shell_menu::ShellMenu>,
+        path: &Path,
+        rows: Vec<ShellItem>,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let Some(menu) = &self.context_menu else {
+            return false;
+        };
+        let ours = match &menu.shell {
+            Some(open) => Rc::ptr_eq(open, &shell),
+            None => self.path_at(&menu.target).as_deref() == Some(path),
+        };
+        let Some(menu) = self.context_menu.as_mut().filter(|_| ours) else {
+            return false;
+        };
+        menu.shell = Some(shell);
+        if !crate::shell_menu::same_rows(&menu.shell_items, &rows) {
+            menu.shell_items = rows.into();
+            menu.highlighted.truncate(1);
+            cx.notify();
+        }
+        true
+    }
+
+    /// Run Explorer's row `id`, close the menu, and let go of Explorer's
+    /// menu once the command has run. In a task, as loading is: a command
+    /// may show a dialog with its own message loop.
+    #[cfg(windows)]
+    fn choose_shell_row(&mut self, id: u32, cx: &Context<'_, Self>) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let (Some(shell), Some(path)) =
+            (menu.shell, self.path_at(&menu.target))
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let ran = shell.invoke(id);
+            drop(shell);
+            let _ = this.update(cx, |this, cx| match ran {
+                Ok(verb) if crate::shell_menu::changes_disk(&verb) => {
                     let folder = this.folder_holding(&path);
                     this.after_outside_change(folder, cx);
                 }
                 Ok(_) => {}
                 Err(error) => {
                     this.notice = Some((
-                        format!("the menu failed: {error}"),
+                        format!("the Explorer command failed: {error}"),
                         Status::Warning,
                     ));
                     cx.notify();
@@ -2974,7 +3215,6 @@ impl Disktree {
         if self.crumb_menu.is_some() && self.on_menu_key(key, cx) {
             return;
         }
-        #[cfg(not(windows))]
         if self.context_menu.is_some() && self.on_context_key(key, cx) {
             return;
         }
@@ -3593,6 +3833,10 @@ impl Render for Disktree {
             window.set_window_title(&title);
             self.window_title = title;
         }
+        // Spawned now, the load runs once this frame, the menu's first
+        // with disktree's rows, is on screen.
+        #[cfg(windows)]
+        self.load_shell_menu(window, cx);
         crate::views::root(self, window, cx)
     }
 }
@@ -3607,6 +3851,17 @@ mod tests {
             origin_x: 100.0,
             origin_y: 50.0,
         }
+    }
+
+    #[test]
+    fn the_arrows_skip_separators_and_disabled_rows() {
+        // A row, a separator, a disabled row, a row, a separator.
+        let rows = [true, false, false, true, false];
+        assert_eq!(step(&rows, 0, true), 3);
+        assert_eq!(step(&rows, 3, false), 0);
+        assert_eq!(step(&rows, 3, true), 3, "nothing below: it stays");
+        assert_eq!(step(&rows, 0, false), 0, "nothing above: it stays");
+        assert_eq!(step(&[], 0, true), 0);
     }
 
     #[test]
