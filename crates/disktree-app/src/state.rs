@@ -59,7 +59,8 @@ pub struct CrumbMenu {
     pub highlighted: usize,
 }
 
-/// The right-click menu, open.
+/// The right-click menu, open. On Windows it is shown natively, and this
+/// only lives from the click to the listener that has the window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextMenu {
     /// What it acts on, by crumbs from the scanned root.
@@ -68,6 +69,7 @@ pub struct ContextMenu {
     pub position: Point<Pixels>,
     /// The row the arrow keys are on, an index into
     /// [`Disktree::context_items`].
+    #[cfg(not(windows))]
     pub highlighted: usize,
 }
 
@@ -83,10 +85,40 @@ pub enum MenuAction {
     Mark,
     /// A terminal in it, or in the folder holding a file.
     Terminal,
-    /// Explorer's own menu for it.
-    #[cfg(windows)]
-    MoreOptions,
 }
+
+impl MenuAction {
+    /// The row's name, for a target that is `marked` or not.
+    pub const fn label(self, marked: bool) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Reveal => REVEAL_LABEL,
+            Self::CopyPath => "Copy path",
+            Self::Mark if marked => "Unmark",
+            Self::Mark => "Mark",
+            Self::Terminal => "Open terminal here",
+        }
+    }
+
+    /// The key that does the same outside the menu, if any.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Open => "enter",
+            Self::Reveal => "o",
+            Self::Mark => "space",
+            Self::CopyPath | Self::Terminal => "",
+        }
+    }
+}
+
+/// What the file manager is called here.
+const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else if cfg!(windows) {
+    "Show in File Explorer"
+} else {
+    "Show in the file manager"
+};
 
 /// One row of a sibling menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -435,10 +467,6 @@ pub struct Disktree {
     pub crumb_menu: Option<CrumbMenu>,
     /// The right-click menu, when open.
     pub context_menu: Option<ContextMenu>,
-    /// "Show more options" was chosen: the path and where its menu opens,
-    /// waiting for a listener that has the window in hand.
-    #[cfg(windows)]
-    shell_menu_request: Option<(PathBuf, Point<Pixels>)>,
     /// The folder watched after something outside disktree may have
     /// changed it, and the poller's epoch: one watch at a time.
     pub watch: Option<crate::watch::Watch>,
@@ -557,8 +585,6 @@ impl Disktree {
             focus: cx.focus_handle(),
             crumb_menu: None,
             context_menu: None,
-            #[cfg(windows)]
-            shell_menu_request: None,
             watch: None,
             watch_epoch: 0,
             color_mode: ColorMode::Kind,
@@ -2479,6 +2505,7 @@ impl Disktree {
         self.context_menu = Some(ContextMenu {
             target,
             position,
+            #[cfg(not(windows))]
             highlighted: 0,
         });
         cx.notify();
@@ -2529,14 +2556,13 @@ impl Disktree {
             MenuAction::Mark,
             MenuAction::Terminal,
         ]);
-        #[cfg(windows)]
-        items.push(MenuAction::MoreOptions);
         items
     }
 
     /// Keys while the right-click menu is open, as in a sibling menu: it
     /// owns the arrows, Enter and Escape, and any other key closes it
     /// before acting.
+    #[cfg(not(windows))]
     fn on_context_key(
         &mut self,
         key: &str,
@@ -2573,8 +2599,7 @@ impl Disktree {
         true
     }
 
-    /// Run a row of the open menu, and close it. "Show more options" only
-    /// asks: the listener that has the window runs [`Self::open_shell_menu`].
+    /// Run a row of the open menu, and close it.
     pub fn choose_context_item(
         &mut self,
         item: MenuAction,
@@ -2639,39 +2664,73 @@ impl Disktree {
                     }
                 }
             }
-            #[cfg(windows)]
-            MenuAction::MoreOptions => {
-                self.shell_menu_request = Some((path, menu.position));
-            }
         }
         cx.notify();
     }
 
-    /// Show Explorer's menu if "Show more options" was chosen. It runs in a
-    /// task, outside this entity's update: the menu's modal loop lets GPUI
-    /// draw and run tasks, which would find the app already borrowed.
+    /// Show the native menu for what [`Self::open_context_menu`] asked
+    /// for: disktree's rows, then Explorer's. It runs in a task, outside
+    /// this entity's update: the menu's modal loop lets GPUI draw and run
+    /// tasks, which would find the app already borrowed.
     #[cfg(windows)]
     pub fn open_shell_menu(&mut self, window: &Window, cx: &Context<'_, Self>) {
-        let Some((path, position)) = self.shell_menu_request.take() else {
+        // The harness has no native window for a modal menu to block on;
+        // the request stays in `context_menu`, for a test to choose from.
+        if cfg!(test) {
+            return;
+        }
+        let Some(menu) = self.context_menu.take() else {
             return;
         };
-        let Some(hwnd) = crate::shell_menu::hwnd(window) else {
+        let (Some(path), Some(hwnd)) =
+            (self.path_at(&menu.target), crate::shell_menu::hwnd(window))
+        else {
             return;
         };
+        let items = self.context_items(&menu.target);
+        let marked = self.marks.contains(&path);
+        // A tab lets Win32 right-align the key, as in any native menu.
+        let labels: Vec<String> = items
+            .iter()
+            .map(|item| match item.key() {
+                "" => item.label(marked).to_string(),
+                key => {
+                    let (first, rest) = key.split_at(1);
+                    format!(
+                        "{}\t{}{rest}",
+                        item.label(marked),
+                        first.to_ascii_uppercase()
+                    )
+                }
+            })
+            .collect();
+        let default = items.iter().position(|&item| item == MenuAction::Open);
         let scale = window.scale_factor();
-        let x = (position.x.as_f32() * scale).round() as i32;
-        let y = (position.y.as_f32() * scale).round() as i32;
+        let x = (menu.position.x.as_f32() * scale).round() as i32;
+        let y = (menu.position.y.as_f32() * scale).round() as i32;
         cx.spawn(async move |this, cx| {
-            let chosen = crate::shell_menu::show(hwnd, &path, x, y);
+            use crate::shell_menu::{Chosen, changes_disk, show};
+            let chosen = show(hwnd, &path, &labels, default, x, y);
             let _ = this.update(cx, |this, cx| match chosen {
-                Ok(Some(verb)) if crate::shell_menu::changes_disk(&verb) => {
+                Ok(Chosen::Own(row)) => {
+                    // The tree may have been refreshed while the menu was
+                    // open, moving the crumbs: find the target again.
+                    if let (Some(&item), Some(target)) =
+                        (items.get(row), this.crumbs_for_path(&path))
+                    {
+                        this.context_menu =
+                            Some(ContextMenu { target, ..menu });
+                        this.choose_context_item(item, cx);
+                    }
+                }
+                Ok(Chosen::Shell(verb)) if changes_disk(&verb) => {
                     let folder = this.folder_holding(&path);
                     this.after_outside_change(folder, cx);
                 }
                 Ok(_) => {}
                 Err(error) => {
                     this.notice = Some((
-                        format!("the Explorer menu failed: {error}"),
+                        format!("the menu failed: {error}"),
                         Status::Warning,
                     ));
                     cx.notify();
@@ -2915,6 +2974,7 @@ impl Disktree {
         if self.crumb_menu.is_some() && self.on_menu_key(key, cx) {
             return;
         }
+        #[cfg(not(windows))]
         if self.context_menu.is_some() && self.on_context_key(key, cx) {
             return;
         }

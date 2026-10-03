@@ -26,9 +26,10 @@ use gpui_omarchy::{
 use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
+#[cfg(not(windows))]
+use crate::state::ContextMenu;
 use crate::state::{
-    ColorMode, ContextMenu, Crumb, Disktree, MenuAction, PANEL_REMS, Screen,
-    panel_width,
+    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -108,11 +109,23 @@ pub fn root(
         .font_family(theme.font)
         .text_size(text::BODY)
         .child(body);
+    // The press picked the target, deeper down; the menu opens on release,
+    // as Windows menus do, so the release cannot pick a row. Only this
+    // listener has the window the native menu needs.
+    #[cfg(windows)]
+    {
+        root = root.on_mouse_up(
+            MouseButton::Right,
+            cx.listener(|this, _, window, cx| this.open_shell_menu(window, cx)),
+        );
+    }
     if app.context_menu.is_none()
         && let Some(tip) = cursor_tooltip(app, window, cx)
     {
         root = root.child(tip);
     }
+    // Windows shows it natively instead, Explorer's rows included.
+    #[cfg(not(windows))]
     if let Some(menu) = app.context_menu.clone() {
         let theme = cx.omarchy().clone();
         root = root.child(
@@ -139,6 +152,7 @@ pub fn root(
 
 /// What can be done with one tile, at the pointer, the way a file manager's
 /// right-click menu offers it.
+#[cfg(not(windows))]
 fn context_menu(
     app: &Disktree,
     menu: &ContextMenu,
@@ -180,20 +194,6 @@ fn context_menu(
         );
     for (index, item) in app.context_items(&menu.target).into_iter().enumerate()
     {
-        let (label, keys) = match item {
-            MenuAction::Open => ("Open", "enter"),
-            MenuAction::Reveal => (REVEAL_LABEL, "o"),
-            MenuAction::CopyPath => ("Copy path", ""),
-            MenuAction::Mark if marked => ("Unmark", "space"),
-            MenuAction::Mark => ("Mark", "space"),
-            MenuAction::Terminal => ("Open terminal here", ""),
-            #[cfg(windows)]
-            MenuAction::MoreOptions => ("Show more options", ""),
-        };
-        #[cfg(windows)]
-        if item == MenuAction::MoreOptions {
-            panel = panel.child(separator(cx));
-        }
         let highlighted = menu.highlighted == index;
         panel = panel.child(
             div()
@@ -209,8 +209,6 @@ fn context_menu(
                 .hover(|style| style.bg(theme.hover_fill()))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.choose_context_item(item, cx);
-                    #[cfg(windows)]
-                    this.open_shell_menu(window, cx);
                     window.focus(&this.focus, cx);
                 }))
                 .child(
@@ -218,28 +216,19 @@ fn context_menu(
                         .flex_1()
                         .text_size(text::BODY)
                         .text_color(theme.bright)
-                        .child(label),
+                        .child(item.label(marked)),
                 )
                 .child(
                     div()
                         .flex_shrink_0()
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
-                        .child(keys),
+                        .child(item.key()),
                 ),
         );
     }
     panel
 }
-
-/// What the file manager is called here.
-const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
-    "Show in Finder"
-} else if cfg!(windows) {
-    "Show in File Explorer"
-} else {
-    "Show in the file manager"
-};
 
 /// Picking another volume scans it from scratch: the picker lists every
 /// volume with its free space, and the choice is the new root.

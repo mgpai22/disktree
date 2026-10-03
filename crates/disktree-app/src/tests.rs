@@ -1635,13 +1635,13 @@ fn restart_arguments_parse_back_to_the_same_scan() {
 }
 
 /// The menu rows' debug selectors, which must outlive the test.
-const CONTEXT_ROWS: [&str; 6] = [
+#[cfg(not(windows))]
+const CONTEXT_ROWS: [&str; 5] = [
     "context-item-0",
     "context-item-1",
     "context-item-2",
     "context-item-3",
     "context-item-4",
-    "context-item-5",
 ];
 
 /// Where junk's name band is on screen: junk itself, not its children.
@@ -1677,6 +1677,7 @@ fn right_click(cx: &mut Window, at: Point<Pixels>) {
 }
 
 /// The row of the open menu that runs `action`.
+#[cfg(not(windows))]
 fn menu_row(
     view: &Entity<Disktree>,
     cx: &Window,
@@ -1689,6 +1690,27 @@ fn menu_row(
             .position(|&item| item == action)
             .expect("the menu lists it")
     })
+}
+
+/// Run `action` from the open menu: by clicking its drawn row, or on
+/// Windows, where the menu is native and the harness only records what it
+/// was asked to show, as a pick in that menu does.
+fn choose(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+    action: crate::state::MenuAction,
+) {
+    #[cfg(not(windows))]
+    {
+        let row = menu_row(view, cx, action);
+        let bounds = cx
+            .debug_bounds(CONTEXT_ROWS[row])
+            .expect("the row is drawn");
+        cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
+    }
+    #[cfg(windows)]
+    update(view, cx, |app, cx| app.choose_context_item(action, cx));
+    draw(cx);
 }
 
 #[gpui_kit::test]
@@ -1711,17 +1733,13 @@ fn a_right_click_selects_the_tile_and_copies_its_path(cx: &mut TestAppContext) {
     });
     assert_eq!(target.as_ref(), Some(&junk));
     assert_eq!(selected, Some(junk));
-    assert!(
+    assert_eq!(
         cx.debug_bounds("context-menu").is_some(),
-        "the menu is drawn"
+        cfg!(not(windows)),
+        "the menu is drawn by disktree except on Windows"
     );
 
-    let row = menu_row(&view, cx, MenuAction::CopyPath);
-    let bounds = cx
-        .debug_bounds(CONTEXT_ROWS[row])
-        .expect("the row is drawn");
-    cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
-    draw(cx);
+    choose(&view, cx, MenuAction::CopyPath);
     let copied = cx
         .read_from_clipboard()
         .and_then(|item| item.text())
@@ -1730,6 +1748,61 @@ fn a_right_click_selects_the_tile_and_copies_its_path(cx: &mut TestAppContext) {
     assert!(read(&view, cx, |app| app.context_menu.is_none()));
 }
 
+#[gpui_kit::test]
+fn the_menu_offers_open_only_where_it_goes_somewhere(cx: &mut TestAppContext) {
+    use crate::state::MenuAction;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let (folder, file, here) = read(&view, cx, |app| {
+        let junk = child_crumbs(app, &[], "junk");
+        let blob = child_crumbs(app, &junk, "blob.bin");
+        (
+            app.context_items(&junk),
+            app.context_items(&blob),
+            app.context_items(&app.crumbs),
+        )
+    });
+    assert_eq!(folder.first(), Some(&MenuAction::Open));
+    assert!(!file.contains(&MenuAction::Open), "a file is not entered");
+    assert!(!here.contains(&MenuAction::Open), "already on screen");
+    for items in [&folder, &file, &here] {
+        assert!(items.contains(&MenuAction::Mark));
+    }
+}
+
+#[gpui_kit::test]
+fn shift_f10_asks_for_the_selection_and_mark_toggles(cx: &mut TestAppContext) {
+    use crate::state::MenuAction;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let (junk, at) = junk_band(&view, cx);
+    right_click(cx, at);
+    #[cfg(not(windows))]
+    press(cx, "escape");
+    #[cfg(windows)]
+    update(&view, cx, |app, _| app.context_menu = None);
+
+    for marked in [1, 0] {
+        press(cx, "shift-f10");
+        let target = read(&view, cx, |app| {
+            app.context_menu.as_ref().map(|menu| menu.target.clone())
+        });
+        assert_eq!(target.as_ref(), Some(&junk));
+        choose(&view, cx, MenuAction::Mark);
+        let marks = read(&view, cx, |app| app.marks.items().to_vec());
+        assert_eq!(marks.len(), marked);
+        assert!(read(&view, cx, |app| app.context_menu.is_none()));
+    }
+}
+
+#[cfg(not(windows))]
 #[gpui_kit::test]
 fn the_menu_marks_from_the_keyboard_and_closes_like_a_menu(
     cx: &mut TestAppContext,

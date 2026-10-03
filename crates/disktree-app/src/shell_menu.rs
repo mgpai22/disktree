@@ -1,5 +1,6 @@
-//! "Show more options": Explorer's own context menu for one path, without
-//! its Delete and Cut. Removal belongs to the marks and the review screen,
+//! The right-click menu on Windows: one native menu, disktree's own rows
+//! first, then Explorer's for the same path. Explorer's part comes without
+//! its Delete and Cut: removal belongs to the marks and the review screen,
 //! where the guards are; a verb that bypassed them would be a second,
 //! unguarded way to delete.
 //!
@@ -30,9 +31,10 @@ use windows_sys::Win32::UI::Shell::{
     SHParseDisplayName,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreatePopupMenu, DeleteMenu, DestroyMenu, GWLP_WNDPROC,
-    GetMenuItemCount, GetMenuItemID, HMENU, MF_BYPOSITION, SW_SHOWNORMAL,
-    SetForegroundWindow, SetWindowLongPtrW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    AppendMenuW, CallWindowProcW, CreatePopupMenu, DeleteMenu, DestroyMenu,
+    GWLP_WNDPROC, GetMenuItemCount, GetMenuItemID, HMENU, InsertMenuW,
+    MF_BYPOSITION, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SetForegroundWindow,
+    SetMenuDefaultItem, SetWindowLongPtrW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM,
     WM_MENUCHAR, WNDPROC,
 };
@@ -49,6 +51,20 @@ const IID_ICONTEXTMENU3: GUID =
 /// any menu: ids are offsets from the first.
 const FIRST_ID: u32 = 1;
 const LAST_ID: u32 = 0x7fff;
+/// Ids of disktree's own rows: above the shell's range, so the id a pick
+/// returns says whose row it was.
+const OWN_FIRST_ID: u32 = LAST_ID + 1;
+
+/// What was picked in the menu.
+#[derive(Debug)]
+pub enum Chosen {
+    Dismissed,
+    /// One of disktree's own rows, by its index among those passed in.
+    Own(usize),
+    /// An Explorer command, already run, by its verb: empty when the
+    /// handler would not name it.
+    Shell(String),
+}
 
 /// Verbs that only look or open, after which nothing on disk has changed
 /// and there is nothing to read again.
@@ -244,25 +260,27 @@ impl Drop for Subclass {
     }
 }
 
-/// Show Explorer's menu for `path` at `(x, y)`, client pixels of the window
-/// `hwnd`, run what is picked, and return its verb: `None` when the menu
-/// was dismissed, an empty verb when the handler would not name it.
+/// Show the menu for `path` at `(x, y)`, client pixels of the window
+/// `hwnd`: the `own` rows, `default` of them in bold, then Explorer's. An
+/// Explorer command is run here; an own row is only returned.
 ///
 /// Must not run inside an entity update: the menu's modal loop lets GPUI
 /// draw and run tasks, which would find the app already borrowed.
 pub fn show(
     hwnd: isize,
     path: &Path,
+    own: &[String],
+    default: Option<usize>,
     x: i32,
     y: i32,
-) -> io::Result<Option<String>> {
+) -> io::Result<Chosen> {
     let hwnd = hwnd as HWND;
     // SAFETY: plain calls; a successful initialisation, including the
     // S_FALSE of one already done on this thread, is balanced below.
     let initialised = unsafe {
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED.cast_unsigned())
     } >= 0;
-    let result = show_initialised(hwnd, path, x, y);
+    let result = show_initialised(hwnd, path, own, default, x, y);
     if initialised {
         // SAFETY: balances the successful CoInitializeEx above.
         unsafe { CoUninitialize() };
@@ -273,89 +291,65 @@ pub fn show(
 fn show_initialised(
     hwnd: HWND,
     path: &Path,
+    own: &[String],
+    default: Option<usize>,
     x: i32,
     y: i32,
-) -> io::Result<Option<String>> {
-    let wide: Vec<u16> =
-        path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut pidl: *mut ITEMIDLIST = null_mut();
-    // SAFETY: `wide` is NUL-terminated and outlives the call.
-    check(unsafe {
-        SHParseDisplayName(
-            wide.as_ptr(),
-            null_mut(),
-            &raw mut pidl,
-            0,
-            null_mut(),
-        )
-    })?;
-    let result = menu_for(hwnd, pidl, x, y);
-    // SAFETY: the shell allocated `pidl`, and nothing refers to it now.
-    unsafe { ILFree(pidl) };
-    result
-}
-
-fn menu_for(
-    hwnd: HWND,
-    pidl: *const ITEMIDLIST,
-    x: i32,
-    y: i32,
-) -> io::Result<Option<String>> {
-    let mut folder = null_mut();
-    let mut child: *mut ITEMIDLIST = null_mut();
-    // SAFETY: `pidl` is valid; `child` points into it and is not freed.
-    check(unsafe {
-        SHBindToParent(pidl, &IID_ISHELLFOLDER, &raw mut folder, &raw mut child)
-    })?;
-    let folder = Com(folder);
-    let mut menu = null_mut();
-    let children = [child.cast_const()];
-    // SAFETY: an IShellFolder, asked for one child it holds.
-    check(unsafe {
-        (folder.vtbl::<ShellFolderVtbl>().get_ui_object_of)(
-            folder.0,
-            hwnd,
-            1,
-            children.as_ptr(),
-            &IID_ICONTEXTMENU,
-            null_mut(),
-            &raw mut menu,
-        )
-    })?;
-    let menu = Com(menu);
+) -> io::Result<Chosen> {
     // SAFETY: plain call; destroyed by the guard below.
     let popup = unsafe { CreatePopupMenu() };
     if popup.is_null() {
         return Err(io::Error::last_os_error());
     }
     let _popup = Popup(popup);
-    // SAFETY: an IContextMenu filling a menu it is given.
-    check(unsafe {
-        (menu.vtbl::<ContextMenuVtbl>().query_context_menu)(
-            menu.0, popup, 0, FIRST_ID, LAST_ID, CMF_NORMAL,
-        )
-    })?;
-    remove_removal_verbs(&menu, popup);
-
-    let mut menu3 = null_mut();
-    // SAFETY: IUnknown's query; a menu without IContextMenu3 says so.
-    let menu3 = (unsafe {
-        (menu.vtbl::<UnknownVtbl>().query_interface)(
-            menu.0,
-            &IID_ICONTEXTMENU3,
-            &raw mut menu3,
-        )
-    } >= 0)
-        .then(|| Com(menu3));
+    for (id, label) in (OWN_FIRST_ID..).zip(own) {
+        let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a live menu; `wide` is NUL-terminated and outlives the
+        // call.
+        let added = unsafe {
+            AppendMenuW(popup, MF_STRING, id as usize, wide.as_ptr())
+        };
+        if added == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if let Some(row) = default {
+        // SAFETY: a live menu and the id of one of its rows.
+        unsafe { SetMenuDefaultItem(popup, OWN_FIRST_ID + row as u32, 0) };
+    }
+    // Without Explorer's part, for a path gone since or a broken handler,
+    // disktree's rows still work, so they are shown alone.
+    let shell = shell_items(hwnd, path, popup, own.len() as u32).ok();
+    // SAFETY: a live menu handle.
+    let count = unsafe { GetMenuItemCount(popup) };
+    // Explorer may have added nothing, and a lone separator would dangle.
+    let shell_rows =
+        usize::try_from(count).is_ok_and(|count| count > own.len());
+    if !own.is_empty() && shell_rows {
+        // SAFETY: a live menu and a position within it.
+        unsafe {
+            InsertMenuW(
+                popup,
+                own.len() as u32,
+                MF_BYPOSITION | MF_SEPARATOR,
+                0,
+                null(),
+            )
+        };
+    }
 
     let mut at = POINT { x, y };
     // SAFETY: `at` is a valid POINT for the call to fill.
     unsafe { ClientToScreen(hwnd, &raw mut at) };
+    let menu3 = shell
+        .as_ref()
+        .and_then(|shell| shell.menu3.as_ref())
+        .map_or(null_mut(), |menu3| menu3.0);
     let chosen = {
         // SAFETY: the window procedure is swapped only for this block and
-        // put back by `Subclass`'s drop, before `menu3` is released.
+        // put back by `Subclass`'s drop, before `shell` is released.
         let _subclass = unsafe {
-            MENU3.set(menu3.as_ref().map_or(null_mut(), |menu3| menu3.0));
+            MENU3.set(menu3);
             let forward: unsafe extern "system" fn(
                 HWND,
                 u32,
@@ -384,13 +378,16 @@ fn menu_for(
         }
     };
     let Ok(id) = u32::try_from(chosen) else {
-        return Ok(None);
+        return Ok(Chosen::Dismissed);
     };
-    if id < FIRST_ID {
-        return Ok(None);
+    if id >= OWN_FIRST_ID {
+        return Ok(Chosen::Own((id - OWN_FIRST_ID) as usize));
     }
+    let Some(shell) = shell.filter(|_| id >= FIRST_ID) else {
+        return Ok(Chosen::Dismissed);
+    };
     let offset = id - FIRST_ID;
-    let verb = verb(&menu, offset).unwrap_or_default();
+    let verb = verb(&shell.menu, offset).unwrap_or_default();
     let info = CMINVOKECOMMANDINFO {
         cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32,
         hwnd,
@@ -401,9 +398,107 @@ fn menu_for(
     };
     // SAFETY: `info` is complete and outlives the call.
     check(unsafe {
-        (menu.vtbl::<ContextMenuVtbl>().invoke_command)(menu.0, &raw const info)
+        (shell.menu.vtbl::<ContextMenuVtbl>().invoke_command)(
+            shell.menu.0,
+            &raw const info,
+        )
     })?;
-    Ok(Some(verb))
+    Ok(Chosen::Shell(verb))
+}
+
+/// Explorer's menu for one path, and what it needs kept alive while it is
+/// open. Fields drop in order: the menu before the folder and item list
+/// it came from.
+struct Shell {
+    menu3: Option<Com>,
+    menu: Com,
+    _folder: Com,
+    _pidl: Pidl,
+}
+
+/// Put Explorer's rows for `path` into `popup` from position `at`, without
+/// Delete and Cut.
+fn shell_items(
+    hwnd: HWND,
+    path: &Path,
+    popup: HMENU,
+    at: u32,
+) -> io::Result<Shell> {
+    let wide: Vec<u16> =
+        path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut pidl: *mut ITEMIDLIST = null_mut();
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    check(unsafe {
+        SHParseDisplayName(
+            wide.as_ptr(),
+            null_mut(),
+            &raw mut pidl,
+            0,
+            null_mut(),
+        )
+    })?;
+    let pidl = Pidl(pidl);
+    let mut folder = null_mut();
+    let mut child: *mut ITEMIDLIST = null_mut();
+    // SAFETY: `pidl` is valid; `child` points into it and is not freed.
+    check(unsafe {
+        SHBindToParent(
+            pidl.0,
+            &IID_ISHELLFOLDER,
+            &raw mut folder,
+            &raw mut child,
+        )
+    })?;
+    let folder = Com(folder);
+    let mut menu = null_mut();
+    let children = [child.cast_const()];
+    // SAFETY: an IShellFolder, asked for one child it holds.
+    check(unsafe {
+        (folder.vtbl::<ShellFolderVtbl>().get_ui_object_of)(
+            folder.0,
+            hwnd,
+            1,
+            children.as_ptr(),
+            &IID_ICONTEXTMENU,
+            null_mut(),
+            &raw mut menu,
+        )
+    })?;
+    let menu = Com(menu);
+    // SAFETY: an IContextMenu filling a menu it is given.
+    check(unsafe {
+        (menu.vtbl::<ContextMenuVtbl>().query_context_menu)(
+            menu.0, popup, at, FIRST_ID, LAST_ID, CMF_NORMAL,
+        )
+    })?;
+    remove_removal_verbs(&menu, popup);
+
+    let mut menu3 = null_mut();
+    // SAFETY: IUnknown's query; a menu without IContextMenu3 says so.
+    let menu3 = (unsafe {
+        (menu.vtbl::<UnknownVtbl>().query_interface)(
+            menu.0,
+            &IID_ICONTEXTMENU3,
+            &raw mut menu3,
+        )
+    } >= 0)
+        .then(|| Com(menu3));
+    Ok(Shell {
+        menu3,
+        menu,
+        _folder: folder,
+        _pidl: pidl,
+    })
+}
+
+/// An item list the shell allocated, freed on drop.
+struct Pidl(*mut ITEMIDLIST);
+
+impl Drop for Pidl {
+    fn drop(&mut self) {
+        // SAFETY: the shell allocated it, and nothing refers to it now.
+        unsafe { ILFree(self.0) };
+    }
 }
 
 /// A popup menu, destroyed on drop.

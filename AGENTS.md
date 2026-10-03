@@ -126,7 +126,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | where a cache is kept, and which an elevated scan trusts | `crates/disktree-core/src/windows.rs` (`cache_path`, `cache_read`, `cache_write`) |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | the right-click menu, refreshing one folder, the folder watch | `crates/disktree-app/src/state.rs`, `watch.rs`, `terminal.rs` |
-| Explorer's own menu ("Show more options") | `crates/disktree-app/src/shell_menu.rs` — the app's only COM `unsafe` |
+| the native right-click menu on Windows: disktree's rows, then Explorer's | `crates/disktree-app/src/shell_menu.rs` — the app's only COM `unsafe` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
